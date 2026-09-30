@@ -28,6 +28,10 @@ OpenAI 客户端 / 任意 SDK
                            poolside/laguna-s-2.1:free，归池按上游分组而非前缀）
 ```
 
+> [!IMPORTANT]
+> **这是 [aimod-cc/agent2api](https://github.com/aimod-cc/agent2api) 的 fork，与上游的差别只有一处：**
+> 上游 v2.9.0 的网页桥（`web_shim.rs`）漏掉了 ZCode 活动套餐令牌池的两个桥接方法，导致 headless 部署的「验证码令牌」永远停在「读取中…」、活动套餐通道回 3007。本仓库已修复（[f8dc469](https://github.com/junjundesk/agent2api/commit/f8dc469)），并由 [GHCR 工作流](.github/workflows/ghcr.yml)自动构建双架构镜像：`ghcr.io/junjundesk/agent2api`。上游镜像 `aimodcc/agent2api` **不含**此修复。修复详情与验证过程见该提交说明。
+
 > **本项目仅供学习与交流使用。** 它通过本地反向代理复用你自己账号的登录态，这种「以非官方客户端形态转发」的方式可能不符合上游服务的用户协议，使用风险（含账号被风控、封禁）由使用者自行承担；禁止用于商业用途或绕过计费。详见[使用声明](#使用声明)与 [LICENSE](./LICENSE)。
 >
 > 本项目是个人用途的本地代理工具，与腾讯（WorkBuddy）、美团（CatPaw）、商汤（小浣熊）、智谱（AutoClaw/autoglm）、阿里巴巴（Qoder / Accio）、华为云（CodeArts）、字节跳动（Trae）、Cline 及其官方产品均无关；所有接口形态来自对各家桌面端通信的观察，上游随时可能调整。
@@ -91,7 +95,7 @@ print(resp.choices[0].message.content)
 ```bash
 docker run -d --name agent2api --restart unless-stopped \
   -p 3065:3065 -v ./data:/data \
-  aimodcc/agent2api:latest
+  ghcr.io/junjundesk/agent2api:latest
 ```
 
 浏览器打开 `http://<主机>:3065`，首次进入会引导**注册管理员账号**（后续登录用它）；登录后在「网关 Key」页创建一把 API Key 给客户端用 —— `http://<主机>:3065/v1` 即 OpenAI 兼容端点，未建 Key 前拒绝转发，建第一把后自动恢复。所有状态（SQLite 库 / 配置 / 日志）都落在 `./data` 一个卷里。
@@ -101,7 +105,7 @@ compose 用户（`docker-compose.yml` 全文就这么多；amd64 / arm64 都有�
 ```yaml
 services:
   agent2api:
-    image: aimodcc/agent2api:latest
+    image: ghcr.io/junjundesk/agent2api:latest
     container_name: agent2api
     restart: unless-stopped
     ports:
@@ -320,11 +324,11 @@ npm run build:icon         # 生成图标源图（改图标设计后执行，再
 
 ## Star History
 
-<a href="https://star-history.com/#aimod-cc/agent2api&Date">
+<a href="https://star-history.com/#junjundesk/agent2api&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=junjundesk/agent2api&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=junjundesk/agent2api&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=junjundesk/agent2api&type=Date" />
   </picture>
 </a>
 

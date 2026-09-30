@@ -23,6 +23,10 @@ OpenAI client / any SDK
                          COSY self-signed headers (not Bearer) · envelope-style SSE (custom encoding and signing)
 ```
 
+> [!IMPORTANT]
+> **This is a fork of [aimod-cc/agent2api](https://github.com/aimod-cc/agent2api) with a single difference from upstream:**
+> upstream v2.9.0's web bridge (`web_shim.rs`) omits the two token-pool bridge methods for the ZCode promo-plan channel, so on headless deployments the "captcha token" readout sticks at "loading…" and the promo-plan channel fails with 3007. This repo fixes it ([f8dc469](https://github.com/junjundesk/agent2api/commit/f8dc469)) and builds a multi-arch image via the [GHCR workflow](.github/workflows/ghcr.yml): `ghcr.io/junjundesk/agent2api`. The upstream image `aimodcc/agent2api` does **not** include this fix. See the commit message for details and verification.
+
 > **This project is for learning and discussion only.** It reuses the login state of your own accounts through a local reverse proxy; forwarding requests in the shape of a non-official client may violate the upstream services' terms of service, and any risk (including rate limiting or account bans) is borne by the user. Commercial use and circumventing billing are prohibited. See [Usage Notice](#usage-notice) and [LICENSE](./LICENSE).
 >
 > This is a personal, local-purpose proxy tool. It is unaffiliated with Tencent (WorkBuddy), Meituan (CatPaw), SenseTime (Raccoon), Zhipu (AutoClaw/autoglm), Alibaba Cloud (Qoder / Accio), Huawei Cloud (CodeArts), ByteDance (Trae), Cline and their official products; every interface shape comes from observing each vendor's desktop client traffic, and upstream may change at any time.
@@ -86,7 +90,7 @@ print(resp.choices[0].message.content)
 ```bash
 docker run -d --name agent2api --restart unless-stopped \
   -p 3065:3065 -v ./data:/data \
-  aimodcc/agent2api:latest
+  ghcr.io/junjundesk/agent2api:latest
 ```
 
 Open `http://<host>:3065` in a browser — the first visit walks you through **registering the admin account**; log in and create an API key in the "Gateway Keys" page for your clients — `http://<host>:3065/v1` is the OpenAI-compatible endpoint (it refuses to forward until the first key exists, then recovers automatically). All state (SQLite database / config / logs) lives in the `./data` volume.
@@ -96,7 +100,7 @@ Compose users (this is the whole `docker-compose.yml`; images are published for 
 ```yaml
 services:
   agent2api:
-    image: aimodcc/agent2api:latest
+    image: ghcr.io/junjundesk/agent2api:latest
     container_name: agent2api
     restart: unless-stopped
     ports:
@@ -313,11 +317,11 @@ One caveat: the LICENSE file carries a **Usage Notice** after the MIT text, whos
 
 ## Star History
 
-<a href="https://star-history.com/#aimod-cc/agent2api&Date">
+<a href="https://star-history.com/#junjundesk/agent2api&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aimod-cc/agent2api&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=junjundesk/agent2api&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=junjundesk/agent2api&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=junjundesk/agent2api&type=Date" />
   </picture>
 </a>
 
