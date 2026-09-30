@@ -1,0 +1,47 @@
+# Agent2API 自建镜像部署（单容器，3065 端口同时是管理面板与 OpenAI 兼容网关）。
+#
+#   本文件与仓库根目录的 docker-compose.yml 是**两个不同用途**：
+#     · docker-compose.yml        —— 上游自带，`build: .` 本地现编，适合开发/自测；
+#     · docker-compose.server.yml —— 本文件，指向**已构建好的自建镜像**，适合部署。
+#
+# ── 为什么需要自建镜像 ────────────────────────────────────────
+# 上游 v2.9.0（ea1cc03）的 web_shim.rs 只搬了 ZCode「领套餐」的三个桥接方法，
+# 漏搬了活动套餐令牌池的两个（zcodeCaptchaStats / pushZcodeCaptchaTokens）。
+# 后果：headless 网页端「验证码令牌」永远停在「读取中…」，活动套餐通道因拿不到
+# 令牌而回 3007（captcha verify failed）。本仓库的 web_shim.rs 已补齐这两条
+# （+20 行，与桌面壳 bridge.rs 的写法对齐），本文件用的就是它编出来的镜像。
+#
+# ── 用法 ──────────────────────────────────────────────────────
+#   1. 构建镜像（在仓库根目录）：
+#        docker build -t agent2api-src:2.9.0-zcodefix .
+#   2. 准备 .env（已被 .gitignore 忽略，不会进仓库）：
+#        AGENT2API_ADMIN_USER=admin
+#        AGENT2API_ADMIN_PASSWORD=<你的密码>
+#   3. 启动：
+#        docker compose -f docker-compose.server.yml up -d
+#
+#   面板     http://<主机>:3065
+#   网关     http://<主机>:3065/v1 （API Key 在面板「网关 Key」页创建）
+#
+# ── 注意 ──────────────────────────────────────────────────────
+#   · 令牌寿命 120 秒，由浏览器页面里的守卫循环铸造。要让活动套餐通道持续可用，
+#     需要至少一个面板页面保持打开；全部关闭后令牌池会耗尽。
+#   · AGENT2API_CAPTCHA_ENABLED 这里默认 0：面板人机验证（ALTCHA 工作量证明）
+#     依赖 Web Crypto，而浏览器只在安全上下文（HTTPS 或 localhost）下提供它。
+#     用 http://<公网IP>:3065 这种明文访问时它会一直卡在验证中。套了 HTTPS
+#     反代之后可以改回 1 恢复这层防护。
+
+services:
+  agent2api:
+    image: agent2api-src:2.9.0-zcodefix
+    container_name: agent2api
+    restart: unless-stopped
+    ports:
+      - "3065:3065"
+    environment:
+      AGENT2API_ADMIN_USER: ${AGENT2API_ADMIN_USER:-}
+      AGENT2API_ADMIN_PASSWORD: ${AGENT2API_ADMIN_PASSWORD:-}
+      AGENT2API_PROXY_PORT: ${AGENT2API_PROXY_PORT:-3065}
+      AGENT2API_CAPTCHA_ENABLED: ${AGENT2API_CAPTCHA_ENABLED:-0}
+    volumes:
+      - ./data:/data

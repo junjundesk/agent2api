@@ -469,6 +469,26 @@ pub fn shim_js() -> &'static str {
         captchaRegion: captchaRegion ? String(captchaRegion) : '',
       });
     },
+    // ── ZCode 活动套餐通道的验证码令牌池（见 core/providers/zcode/captcha.rs）──
+    // 与上面三条**不是一回事**：那三条服务「领套餐」（用户动作，拖滑块拿串）；
+    // 这两条服务**转发** —— 活动套餐的推理端点每条请求都要一个当次铸的令牌，
+    // 而转发在后台发生，令牌只能由界面静默铸造后推进池子（唯一调用方是
+    // ui/zcode-captcha-pool.js，账号设置里那行「验证码令牌：x / 3」也读它）。
+    // 响应形状见 `api::zcode_captcha`。
+    //
+    // 铸造发生在**浏览器**里（ui/aliyun-captcha.js 的阿里云无痕验证，走
+    // o.alicdn.com 的 SDK），不依赖 Web Crypto、也不需要安全上下文 ——
+    // 桌面桥与网页桥在这一点上没有差别，网页端同样铸得出来。
+    //
+    // 少了这两个方法时：令牌池守卫每轮拿到 undefined 就静默退让，池子恒空，
+    // 活动套餐通道回 3007（captcha verify failed），而界面那行读数停在
+    // 「读取中…」——正是本模块早先只搬了领取三条、漏搬这两条的后果。
+    zcodeCaptchaStats: function () { return call('GET', '/api/zcode/captcha'); },
+    pushZcodeCaptchaTokens: function (tokens) {
+      return call('POST', '/api/zcode/captcha', {
+        tokens: Array.isArray(tokens) ? tokens : [],
+      });
+    },
     onLoginState: function (callback) {
       loginListeners.add(callback);
       return function () { loginListeners.delete(callback); };
