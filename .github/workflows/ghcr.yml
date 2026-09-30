@@ -1,0 +1,104 @@
+name: ghcr
+
+# 构建网关镜像（amd64 + arm64）并推送到 GitHub Container Registry。
+#
+# ── 为什么单独一个文件，不去改上游的 docker.yml ────────────────
+# 上游 docker.yml 推的是 Docker Hub（aimodcc/agent2api），依赖
+# DOCKERHUB_USERNAME / DOCKERHUB_TOKEN 两个 secrets —— fork 里没有，
+# 那个工作流在本仓库必然失败。GHCR 用仓库自带的 GITHUB_TOKEN 即可，
+# 不需要任何额外 secret，所以单独走一条。
+#
+# ── 触发方式 ──────────────────────────────────────────────────
+#   · 推 main：产出 :latest、:2.9.0-zcodefix 与 :sha-<短哈希>
+#     （:2.9.0-zcodefix 是为了与本地 docker build 出来的镜像 tag 对齐，
+#       服务器 compose 换镜像时可以直接改一行；不需要时可以删掉这条）
+#   · 推 v* tag：产出 :<版本号>
+#   · 手动 workflow_dispatch：与推 main 相同
+#
+# 上游的 build.yml / docker.yml 只在 workflow_dispatch 与 v* tag 触发，
+# 所以推 main 不会把它们带起来。
+#
+# ── 本仓库与上游的差异 ────────────────────────────────────────
+# 这份 fork 在 web_shim.rs 里补了 ZCode 活动套餐令牌池的两个桥接方法
+# （见提交 f8dc469），编出来的镜像因此与 aimodcc/agent2api 不同 ——
+# 这正是要自己出一份镜像的原因。
+#
+# ── 为什么 runner 上要装 QEMU（与上游 docker.yml 的差异）──────
+# 上游注释说「不用装 QEMU」，那是指 **Rust 编译**：Dockerfile 的 builder
+# 固定跑在 $BUILDPLATFORM，arm64 走 aarch64 工具链交叉编译，不进模拟。
+# 但**运行阶段**（FROM debian:bookworm-slim，不带 --platform）在 arm64
+# 构建时要跑 apt-get install，那是 arm64 用户态程序，没有 binfmt 就只能
+# 靠模拟。装上 QEMU 只为这一步，开销几秒；Rust 那段依旧走交叉编译。
+#
+# ── 缓存 ─────────────────────────────────────────────────────
+# type=gha 把 BuildKit 缓存挂到 Actions cache：Dockerfile 的「桩依赖层」
+# 首次编完整棵依赖树后落缓存，之后每次构建直接命中，只剩源码层重编。
+#
+# ── 权限 ─────────────────────────────────────────────────────
+# packages: write 是推 GHCR 必需的；contents: read 只够检出源码。
+#
+# ── 注意 ─────────────────────────────────────────────────────
+#   · GHCR 新包默认**私有**。首次推送后若要让别人免登录拉取，需到
+#     https://github.com/users/junjundesk/packages/container/agent2api/settings
+#     把 visibility 改成 Public（也可以用带 write:packages 的 token 走
+#     API 改，见 README/运维笔记）。
+#   · 拉私有包要先登录：echo $GITHUB_TOKEN | docker login ghcr.io -u <用户名> --password-stdin
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # github.repository 已是小写（junjundesk/agent2api）—— GHCR 的镜像名
+  # 强制小写，仓库名若含大写要先转换，这里不需要。
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # 只为运行阶段的 apt-get（见文件头说明），Rust 编译不走模拟
+      - name: 设置 QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: 设置 buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: 生成镜像 tag
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=2.9.0-zcodefix,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=sha,format=short
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
