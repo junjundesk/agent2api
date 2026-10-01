@@ -20,6 +20,8 @@
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
+use std::sync::OnceLock;
+
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::Response;
@@ -34,11 +36,26 @@ use crate::server::core::providers::zcode::captcha;
 
 /// 界面希望维持的库存目标（低于它就该补货）。
 ///
-/// 取 3：一个够「下一条请求立刻有得用」，又不至于铸一堆用不掉（令牌 2 分钟就
+/// 默认 3：一个够「下一条请求立刻有得用」，又不至于铸一堆用不掉（令牌 2 分钟就
 /// 过期，铸太多纯属浪费风控配额 —— 阿里云对铸造频率有风控，参考实现为此专门
 /// 做了限速与熔断）。高并发场景下池子会短暂见底，那时的正确行为是让请求如实
 /// 失败并提示，而不是无节制地铸。
-const POOL_TARGET: usize = 3;
+///
+/// `AGENT2API_ZCODE_CAPTCHA_TARGET` 可以把水位调高（1..=50，非法值忽略、回默认 3）：
+/// 同一时刻好几条请求一起到的部署值得调 —— 目标越高，稳态铸造越频繁（约每
+/// 目标/120 秒 一次），铸了用不掉的令牌烧的都是阿里云风控配额；调之前先看池子
+/// 计数（`GET /api/zcode/captcha` 的 minted / stale），用不掉的比例高就别加。
+/// 进程内读取一次即冻结，改了值要重启进程才生效。
+fn pool_target() -> u64 {
+    static TARGET: OnceLock<u64> = OnceLock::new();
+    *TARGET.get_or_init(|| {
+        std::env::var("AGENT2API_ZCODE_CAPTCHA_TARGET")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|value| (1..=50).contains(value))
+            .unwrap_or(3)
+    })
+}
 
 /// `GET /api/zcode/captcha` —— 池子概况 + 「界面该不该铸造」的判据
 fn stats_json(state: &ServerState) -> Value {
@@ -47,7 +64,7 @@ fn stats_json(state: &ServerState) -> Value {
     // 先算好「库存够不够」（`body` 随后要被可变借用，读值得在借用之前取）
     let ready = body.get("ready").and_then(Value::as_u64).unwrap_or(0);
     if let Some(object) = body.as_object_mut() {
-        object.insert("target".to_string(), Value::from(POOL_TARGET as u64));
+        object.insert("target".to_string(), Value::from(pool_target()));
         object.insert(
             "startPlanAccounts".to_string(),
             Value::from(start_plan_accounts as u64),
@@ -55,7 +72,7 @@ fn stats_json(state: &ServerState) -> Value {
         // 铸造器唯一需要的那个布尔：有账号要走这条路、且库存不足目标
         object.insert(
             "needsTokens".to_string(),
-            Value::Bool(start_plan_accounts > 0 && ready < POOL_TARGET as u64),
+            Value::Bool(start_plan_accounts > 0 && ready < pool_target()),
         );
         // 顺手给一个**可用的账号 id**：铸造器还要拿它去问上游那份风控配置
         // （sceneId / prefix / region）。让界面自己去读账号列表会把「哪些账号
@@ -151,7 +168,7 @@ pub async fn push_captcha(State(state): State<ServerState>, body: Bytes) -> Resp
             "🔐 人机验证令牌入池 {} 个（库存 {}，目标 {}）",
             accepted,
             captcha::ready(),
-            POOL_TARGET,
+            pool_target(),
         ),
     );
     let mut response = stats_json(&state);

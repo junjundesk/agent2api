@@ -1,0 +1,25 @@
+# ZCode 活动套餐验证码令牌 · 纯后台铸造器（sidecar）
+#
+# 与 agent2api 网关同一网络，走管理 API（x-api-key 鉴权）轮询→铸→推池，
+# 不依赖任何面板页面存活。用法：
+#   cd /opt/agent2api-mint && docker compose -f docker-compose.mint.yml up -d
+#
+# 注意：本文件假设与 /opt/agent2api 的 agent2api 容器共用外部网络
+# agent2api_default。若网关换了项目名/网络名，改下面的 networks 段。
+services:
+  agent2api-mint:
+    image: agent2api-mint:latest
+    build: .
+    container_name: agent2api-mint
+    restart: unless-stopped
+    environment:
+      - AGENT2API_BASE_URL=http://agent2api:3065
+      # 网关 Key（面板「网关 Key」页；与面板会话同权，仅本机容器网络可达）
+      # 仓库副本不存真值：换成面板「网关 Key」页生成的 sk-a2a-…
+      - AGENT2API_GATEWAY_KEY=REPLACE_WITH_GATEWAY_KEY
+    networks:
+      - agent2api_default
+
+networks:
+  agent2api_default:
+    external: true

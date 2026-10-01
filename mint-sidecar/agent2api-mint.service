@@ -1,0 +1,32 @@
+# ZCode 活动套餐验证码令牌铸造器 · systemd 常驻服务（服务器实际采用的方式）
+#
+# 安装（root）：
+#   1. 放代码：/opt/agent2api-mint/（mint.js + node_modules，见 README 的安装命令）
+#   2. 本文件 → /etc/systemd/system/agent2api-mint.service
+#   3. systemctl daemon-reload && systemctl enable --now agent2api-mint
+#
+# 为什么用 systemd 而不是容器：服务器（见 README）上 Docker Hub 拉 node 基础镜像
+# 不稳定，而宿主机自带 Node 22；网关在本机 3065，直连 127.0.0.1 即可，
+# 不需要容器网络。产物与容器版完全一致（同一个 mint.js）。
+[Unit]
+Description=Agent2API ZCode captcha token minter (happy-dom sidecar)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/agent2api-mint
+Environment=AGENT2API_BASE_URL=http://127.0.0.1:3065
+# 网关 Key（面板「网关 Key」页）；与面板会话同权，仅本机可达的服务使用
+# 仓库副本不存真值：部署时把下面这行换成面板「网关 Key」页生成的 sk-a2a-…
+Environment=AGENT2API_GATEWAY_KEY=REPLACE_WITH_GATEWAY_KEY
+ExecStart=/usr/bin/node /opt/agent2api-mint/mint.js
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

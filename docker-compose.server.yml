@@ -24,8 +24,10 @@
 #   网关     http://<主机>:3065/v1 （API Key 在面板「网关 Key」页创建）
 #
 # ── 注意 ──────────────────────────────────────────────────────
-#   · 令牌寿命 120 秒，由浏览器页面里的守卫循环铸造。要让活动套餐通道持续可用，
-#     需要至少一个面板页面保持打开；全部关闭后令牌池会耗尽。
+#   · 令牌寿命 120 秒。网关自带的铸造器在**浏览器页面**里（面板开着才铸），
+#     用 mint-sidecar/ 里的**纯后台铸造器**补上这一段：常驻进程轮询网关管理
+#     API、在 happy-dom 里跑阿里云 SDK 静默铸造，页面全关也不断供。部署方式
+#     与原理见 mint-sidecar/README.md（服务器 38.76.209.3 上以 systemd 常驻）。
 #   · AGENT2API_CAPTCHA_ENABLED 这里默认 0：面板人机验证（ALTCHA 工作量证明）
 #     依赖 Web Crypto，而浏览器只在安全上下文（HTTPS 或 localhost）下提供它。
 #     用 http://<公网IP>:3065 这种明文访问时它会一直卡在验证中。套了 HTTPS
@@ -43,5 +45,8 @@ services:
       AGENT2API_ADMIN_PASSWORD: ${AGENT2API_ADMIN_PASSWORD:-}
       AGENT2API_PROXY_PORT: ${AGENT2API_PROXY_PORT:-3065}
       AGENT2API_CAPTCHA_ENABLED: ${AGENT2API_CAPTCHA_ENABLED:-0}
+      # ZCode 活动套餐令牌池库存目标（网关默认 3）。6 = 把突发容纳窗口加倍；
+      # 代价与边界见 zcode_captcha.rs 的 pool_target 注释。
+      AGENT2API_ZCODE_CAPTCHA_TARGET: ${AGENT2API_ZCODE_CAPTCHA_TARGET:-6}
     volumes:
       - ./data:/data

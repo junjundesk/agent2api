@@ -1,0 +1,14 @@
+{
+  "name": "agent2api-zcode-mint-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "ZCode 活动套餐验证码令牌的纯后台铸造器（happy-dom 跑阿里云 SDK，不依赖面板页面）",
+  "main": "mint.js",
+  "scripts": {
+    "start": "node mint.js"
+  },
+  "dependencies": {
+    "happy-dom": "^15.11.7"
+  }
+}
