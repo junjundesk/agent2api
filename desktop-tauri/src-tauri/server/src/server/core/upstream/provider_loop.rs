@@ -96,6 +96,9 @@ use super::{
     MAX_ROUTE_ATTEMPTS,
 };
 
+#[cfg(test)]
+mod tests;
+
 /// 上游一次请求的失败（已分类 + 已构好给客户端的错误）。
 struct OutboundFailure {
     /// 适配器给出的分类（决定编排动作）
@@ -459,8 +462,14 @@ async fn attempt_queue(
         if ctx.telemetry.is_cancelled() {
             return Err(cancellation::cancelled_error());
         }
-        let target =
-            rotate::select_target_account(service, provider_ids, &cooldown_keys, &tried_ids).await?;
+        let target = rotate::select_target_account(
+            service,
+            provider_ids,
+            &cooldown_keys,
+            &tried_ids,
+            ctx.pinned_account,
+        )
+        .await?;
         // 连接计数改绑到这一轮选中的账号：失败重试换账号时计数跟着走，
         // 于是「一个请求任意时刻只占一个账号」这条口径不需要每个分支各维护一次
         // （429 降级、401 刷新后换号、会话式失败顺延三条路径都经过这里）。
@@ -523,6 +532,7 @@ async fn attempt_queue(
                         provider_ids,
                         &cooldown_keys,
                         &tried_ids,
+                        ctx.pinned_account,
                     ) {
                         Some(next) => {
                             // 换号额度用尽 → 队列里即使还有人也不再顺延
@@ -588,16 +598,55 @@ async fn attempt_queue(
                         );
                         return Err(cancellation::cancelled_error());
                     }
-                    if let Some(account_id) = stateful_account_id {
+                    if let Some(account_id) = stateful_account_id.clone() {
                         if !tried_ids.contains(&account_id) {
                             tried_ids.push(account_id);
                         }
+                    }
+                    // ── 会话式路径的限额记账（与无状态「动作 1」同一语义）──
+                    // 分类由适配器供给（默认 Fatal，既有家逐字不变）；取到的
+                    // QuotaLimited 只用它的**记账**语义 —— 标冷却后仍走下面的
+                    // 队列顺延，不套用无状态的重试/刷新动作。冷却键从
+                    // `cooldown_keys` 解析（与判定侧同源）；会话式分支发生在
+                    // 发送体构建之前，拿不到 `SendBody::wire_model`。
+                    if let (UpstreamErrorClass::QuotaLimited { status, upstream_code, .. },
+                            Some(account_id)) =
+                        (adapter.classify_conversation_error(&error), &stateful_account_id)
+                    {
+                        let wire = cooldown_keys.for_provider(provider_id);
+                        let group = adapter.quota_cooldown_models(account_id, &wire);
+                        for name in &group {
+                            rotate::mark_account_limited(
+                                service,
+                                account_id,
+                                name,
+                                i32::from(status),
+                                upstream_code,
+                                None,
+                                &error.message,
+                            );
+                        }
+                        let label = if group.len() > 1 {
+                            format!("{} 等 {} 个模型（福利池按账号记账）",
+                                    group.first().cloned().unwrap_or_else(|| wire.clone()),
+                                    group.len())
+                        } else {
+                            wire.clone()
+                        };
+                        logging::console_line(
+                            "[Upstream]",
+                            &format!(
+                                "⚠️ 会话式账号 {} 对模型 {} 已限额，标记冷却后按队列顺延",
+                                account_id, label,
+                            ),
+                        );
                     }
                     match rotate::pick_next_account(
                         service,
                         provider_ids,
                         &cooldown_keys,
                         &tried_ids,
+                        ctx.pinned_account,
                     ) {
                         Some(next) => {
                             // 换号额度用尽 → 队列里即使还有人也不再顺延
@@ -1037,6 +1086,7 @@ async fn attempt_queue(
                                 provider_ids,
                                 &cooldown_keys,
                                 &tried_ids,
+                                ctx.pinned_account,
                             ) {
                                 Some(next) => {
                                     let next_label = account_display(&next);
@@ -1138,6 +1188,7 @@ async fn attempt_queue(
                         provider_ids,
                         &cooldown_keys,
                         &tried_ids,
+                        ctx.pinned_account,
                     ) {
                         Some(next) => {
                             if !take_switch(&mut switches_left, switch_total) {
@@ -1767,7 +1818,7 @@ async fn sleep_or_cancel(
 
 /// 发一次上游请求，含「可退避重试」循环（次数 / 间隔来自设置页的全局重试设置）。
 ///
-/// 成功的定义是 HTTP 2xx —— 与改造前 `request_with_waf_retry` 一致。
+/// 默认以 HTTP 2xx 判成功；适配器可按响应头识别伪装成 2xx 的业务错误。
 ///
 /// 重试判定分两档：
 ///   - **适配器声明**（`retry_advice`）：provider 专属知识（workbuddy 的 11128），
@@ -1844,7 +1895,7 @@ async fn send_with_retry(
                 });
             }
         };
-        if response.status().is_success() {
+        if !adapter.is_error_response(response.status().as_u16(), response.headers()) {
             return Ok(response);
         }
         let status = response.status().as_u16();

@@ -50,6 +50,7 @@ import {
   shared,
   toast,
   type AppSettings,
+  type ClineHeadersData,
   type GatewayBlocks,
   type NumberField,
   type PromptPatch,
@@ -66,6 +67,7 @@ export type LoadStatus = 'loading' | 'ready' | 'unavailable'
  */
 export type BusyScope =
   | 'app'
+  | 'lan'
   | 'retention'
   | 'retry'
   | 'codes'
@@ -73,6 +75,8 @@ export type BusyScope =
   | 'queue'
   | 'debug'
   | 'sanitize'
+  | 'clineHeaders'
+  | 'cors'
   | 'prompt'
   | 'captcha'
   | 'export'
@@ -82,11 +86,25 @@ export type BusyScope =
 /**
  * 启动与托盘。unavailable 时开关**仍可拨**（照旧实现：拨了直接发全量 patch，
  * 保存成功即回到 ready），只把徽章与状态行换成提示。
+ *
+ * 局域网访问的字段随同一份设置读写；`lanIp` / `port` / `adminRegistered` 是
+ * 展示与流程用的**旁路信息**，各自独立查询、各自失败各自保持旧值（都是
+ * 「锦上添花」的读数，查询失败不该拖垮设置本身）。
  */
 export type AppState = {
   status: LoadStatus
   closeToTray: boolean
   autostart: boolean
+  /** 局域网访问：监听 0.0.0.0（改动随「应用重启」生效） */
+  lanAccess: boolean
+  /** 局域网访问开启时是否同时托管网页管理面板 */
+  lanPanel: boolean
+  /** 本机在局域网里的 IP（查不到为 null，地址展示退化为占位符） */
+  lanIp: string | null
+  /** 网关端口（0 = 还没查到），拼局域网地址用 */
+  port: number
+  /** 面板管理员是否已注册（null = 还没查过；流程里会再查一次拿最新值） */
+  adminRegistered: boolean | null
 }
 
 /** 数值面板：values 为 null 时（loading / unavailable）各输入框保持禁用 */
@@ -101,6 +119,17 @@ export type DebugState = {
 }
 
 export type SanitizeState = { status: LoadStatus; on: boolean }
+
+/** Cline 伪装头：三份表（默认 / 覆盖 / 生效）都来自后端，界面据此渲染与判断改动 */
+export type ClineHeadersState = {
+  status: LoadStatus
+  defaults: Record<string, string>
+  overrides: Record<string, string>
+  effective: Record<string, string>
+}
+
+/** 网关面（/v1/*）跨域访问开关；与 SanitizeState 同形 */
+export type CorsState = { status: LoadStatus; on: boolean }
 
 export type PromptState = {
   status: LoadStatus
@@ -192,15 +221,30 @@ export type SettingsSnapshot = {
   queue: NumericState
   debug: DebugState
   sanitize: SanitizeState
+  clineHeaders: ClineHeadersState
+  cors: CorsState
   prompt: PromptState
   storage: StorageState
   captcha: { available: boolean; enabled: boolean }
   ioFailure: IoFailure
   /** 保留期改小的确认框正文（非空即开着）；确认 / 取消都收口到 resolveRetentionConfirm */
   retentionConfirm: { head: string } | null
+  /** 局域网访问的确认框（非空即开着）；确认 / 取消都收口到 resolveLanConfirm */
+  lanConfirm: LanConfirm
+  /** 局域网开启流程的注册步（非空 = 弹窗切到注册表单） */
+  lanRegister: LanRegister
   /** 面板登录整块：仅网页端渲染 */
   panelLogin: boolean
 }
+
+/**
+ * 局域网访问确认框的内容。`mode` 决定确认后的动作（enable 还要看注册状态，
+ * 可能接注册步）；`panel` 是「网页面板」子开关的目标值（mode 为 panel 时）。
+ */
+export type LanConfirm = { mode: 'enable' | 'disable' | 'panel'; panel: boolean } | null
+
+/** 注册步的状态：busy 时按钮转圈，error 非空时红字显示在表单里 */
+export type LanRegister = { busy: boolean; error: string } | null
 
 /** 是否网页端（桌面壳的面板跟着应用走，没有「登录面板」的概念） */
 export function readPanelLogin(): boolean {
@@ -213,7 +257,16 @@ const INITIAL: SettingsSnapshot = {
   category: CATEGORIES[0].id,
   scrollReset: 0,
   busy: null,
-  app: { status: 'loading', closeToTray: false, autostart: false },
+  app: {
+    status: 'loading',
+    closeToTray: false,
+    autostart: false,
+    lanAccess: false,
+    lanPanel: false,
+    lanIp: null,
+    port: 0,
+    adminRegistered: null,
+  },
   unitsChinese: true,
   retention: { status: 'loading', values: null },
   retry: { status: 'loading', values: null },
@@ -222,6 +275,8 @@ const INITIAL: SettingsSnapshot = {
   queue: { status: 'loading', values: null },
   debug: { status: 'loading', on: false, count: null, limit: null },
   sanitize: { status: 'loading', on: false },
+  clineHeaders: { status: 'loading', defaults: {}, overrides: {}, effective: {} },
+  cors: { status: 'loading', on: false },
   prompt: {
     status: 'loading',
     mode: 'passthrough',
@@ -251,6 +306,8 @@ const INITIAL: SettingsSnapshot = {
   captcha: { available: true, enabled: false },
   ioFailure: null,
   retentionConfirm: null,
+  lanConfirm: null,
+  lanRegister: null,
   panelLogin: false,
 }
 
@@ -277,6 +334,24 @@ export function useSettings(): SettingsSnapshot {
 function publish(patch: Partial<SettingsSnapshot>): void {
   snapshot = { ...snapshot, ...patch }
   for (const listener of subscribers) listener()
+}
+
+/**
+ * 只改 `app` 子树的发布入口（**写 app 的地方一律走这里**）。
+ *
+ * 不能散着写 `publish({ app: { ...snapshot.app, ... } })`：对象字面量的展开发生在
+ * **表达式求值那一刻**。调用点只要跨了 await，旧子树就先被展开进字面量、等 await
+ * 回来才发布 —— 这段时间里并行的其它来源（`loadSettings` 写 status/lanAccess、
+ * 旁路读数写 lanIp/port）已经写好的值会被整块盖回旧值。
+ *
+ * 真实事故（局域网访问上线后）：`loadLanExtras` 把 `...snapshot.app` 与
+ * `await api.localIp()` 写在同一行的字面量里，本机网络快、「旁路读数」后落地时，
+ * 设置页永远停在「检测中…」、局域网开关显示未开启 —— 设置其实早就写进库了
+ * （后端也确实监听了 0.0.0.0），只是被旧子树盖掉。走本函数则展开发生在
+ * **发布那一刻**，谁先谁后都不会丢字段。
+ */
+function publishApp(patch: Partial<AppState>): void {
+  publish({ app: { ...snapshot.app, ...patch } })
 }
 
 /**
@@ -362,13 +437,18 @@ export function applyUnits(on: boolean): void {
 export function renderSettings(data?: unknown): void {
   if (data === undefined) return
   if (!data || typeof data !== 'object') {
-    publish({ app: { ...snapshot.app, status: 'unavailable' } })
+    publishApp({ status: 'unavailable' })
     return
   }
   const record = data as Record<string, unknown>
-  // 主进程返回的字段一律按「严格 true」判定，缺字段时按关闭处理（与后端默认值一致）
-  publish({
-    app: { status: 'ready', closeToTray: record.closeToTray === true, autostart: record.autostart === true },
+  // 主进程返回的字段一律按「严格 true」判定，缺字段时按关闭处理（与后端默认值一致）。
+  // lanIp / port / adminRegistered 是旁路读数，不在启动设置的响应里 —— 保留当前值。
+  publishApp({
+    status: 'ready',
+    closeToTray: record.closeToTray === true,
+    autostart: record.autostart === true,
+    lanAccess: record.lanAccess === true,
+    lanPanel: record.lanPanel === true,
   })
 }
 
@@ -382,6 +462,29 @@ async function loadSettings(): Promise<void> {
 }
 
 /**
+ * 局域网访问的旁路读数：本机 IP、网关端口、管理员注册状态。
+ *
+ * 三个查询互相独立、各自失败各自保持旧值 —— 它们只服务展示与流程提示，
+ * 任何一个是空都不该影响设置开关本身。web 端（shim 没有这组方法）直接跳过：
+ * 网页面板不渲染这一块。
+ */
+async function loadLanExtras(): Promise<void> {
+  const api = shared().workbuddyDesktop
+  if (!api?.localIp) return
+  try {
+    publishApp({ lanIp: (await api.localIp()) || null })
+  } catch { /* 查不到就不显示，地址展示退化成占位符 */ }
+  try {
+    const port = Number((await api.getBackendStatus?.())?.port) || 0
+    if (port) publishApp({ port })
+  } catch { /* 端口保持 0，地址展示退化 */ }
+  try {
+    const registered = (await api.panelAdminStatus?.())?.registered === true
+    publishApp({ adminRegistered: registered })
+  } catch { /* 状态保持「未查」；开启流程会再查一次拿最新值 */ }
+}
+
+/**
  * 拨动启动 / 托盘开关。patch 是**全量覆盖**（契约要求），另一项取快照里的当前值
  * —— 旧实现读的是 DOM 里那个 checkbox 的 checked，等价。
  * 忙碌中早退时什么都不写：受控开关的 checked 来自快照，界面自动「还原这一下拨动」。
@@ -392,21 +495,140 @@ export async function saveToggle(kind: 'tray' | 'autostart', next: boolean): Pro
   const patch: AppSettings = {
     closeToTray: kind === 'tray' ? next : previous.closeToTray,
     autostart: kind === 'autostart' ? next : previous.autostart,
+    // 局域网访问归「局域网访问」面板管（它有自己的确认与重启流程），
+    // 全量覆盖的 patch 里原样带上磁盘现值，避免把它悄悄抹掉
+    lanAccess: previous.lanAccess,
+    lanPanel: previous.lanPanel,
   }
   beginBusy('app')
-  publish({ app: { ...previous, ...patch } })
+  publishApp(patch)
   const label = kind === 'autostart' ? '开机自动启动' : '关闭窗口时最小化到托盘'
   try {
     const api = shared().workbuddyDesktop
     if (!api) throw new Error('主进程桥不可用')
     const saved = await api.saveAppSettings(patch)
-    // 以主进程返回的设置为准渲染，避免界面与真实状态不一致
-    publish({ app: { status: 'ready', ...normalizeApp(saved, patch) } })
+    // 以主进程返回的设置为准渲染，避免界面与真实状态不一致（旁路读数保留当前值）
+    publishApp({ status: 'ready', ...normalizeApp(saved, patch) })
     toast(`✅ 已更新「${label}」`)
   } catch (error) {
     // 回滚到拨动前的状态（旧实现：已知状态按状态回滚，未知状态只把刚切的这项切回去）
-    publish({ app: previous })
+    publishApp(previous)
     toast(`保存失败：${errorMessage(error)}`, 'err')
+  } finally {
+    endBusy()
+  }
+}
+
+/* ─── 局域网访问（仅桌面端；流程说明见各函数） ── */
+
+/**
+ * 拨动「允许局域网访问」。开与关都先过确认框：开启意味着监听地址出回环
+ * （安全语义变化 + 可能要先注册管理员），关闭意味着局域网设备马上断开，
+ * 且两者都要**重启应用**才生效 —— 这些都该让用户先知道。
+ * 确认前开关不落快照（受控组件自动弹回），保存成功后随重启以新值重来。
+ */
+export function toggleLan(next: boolean): void {
+  if (busyScope) { repaint(); return }
+  publish({ lanConfirm: { mode: next ? 'enable' : 'disable', panel: snapshot.app.lanPanel } })
+}
+
+/** 拨动「同时开放网页管理面板」（仅在局域网访问开启时可拨；同样要重启应用） */
+export function toggleLanPanel(next: boolean): void {
+  if (busyScope) { repaint(); return }
+  publish({ lanConfirm: { mode: 'panel', panel: next } })
+}
+
+/** 确认框的出口（与 resolveRetentionConfirm 同形）：确认 true / 取消与关窗 false */
+export function resolveLanConfirm(accepted: boolean): void {
+  const current = snapshot.lanConfirm
+  publish({ lanConfirm: null })
+  if (!current || !accepted) return
+  if (current.mode === 'disable') { void applyLan(false, false); return }
+  if (current.mode === 'panel') { void applyLan(true, current.panel); return }
+  void proceedEnable()
+}
+
+/**
+ * 开启流程：确认后先查管理员注册状态（现场查一次，不用加载时的旧值 ——
+ * 从加载到确认之间状态可能变过）。已注册直接应用；没注册进注册步，
+ * 注册成功后无缝继续（就是用户在确认框里读到的那句「将跳转注册」）。
+ */
+async function proceedEnable(): Promise<void> {
+  const api = shared().workbuddyDesktop
+  if (!api?.panelAdminStatus) { toast('当前环境不支持局域网访问设置', 'err'); return }
+  beginBusy('lan')
+  let registered: boolean
+  try {
+    registered = (await api.panelAdminStatus())?.registered === true
+  } catch (error) {
+    endBusy()
+    toast(`查询管理员状态失败：${errorMessage(error)}`, 'err')
+    return
+  }
+  endBusy()
+  publishApp({ adminRegistered: registered })
+  if (registered) {
+    await applyLan(true, snapshot.app.lanPanel)
+    return
+  }
+  publish({ lanRegister: { busy: false, error: '' } })
+}
+
+/**
+ * 注册表单提交：校验 → 注册 → 直接继续开启流程。校验口径与后端一致
+ * （账号 64 字符以内、密码至少 8 位）；「管理员已存在」由壳命令折叠成
+ * `existed: true`，这里当作成功继续 —— 流程只关心「现在有没有管理员」。
+ */
+export async function submitLanRegister(username: string, password: string): Promise<void> {
+  if (busyScope) return
+  const api = shared().workbuddyDesktop
+  if (!api?.panelRegister) return
+  const name = username.trim()
+  if (!name || name.length > 64) {
+    publish({ lanRegister: { busy: false, error: '请填写管理员账号（64 字符以内）' } })
+    return
+  }
+  if (password.length < 8) {
+    publish({ lanRegister: { busy: false, error: '密码至少 8 位' } })
+    return
+  }
+  publish({ lanRegister: { busy: true, error: '' } })
+  try {
+    await api.panelRegister(name, password)
+    // 用户在注册期间关掉了弹窗：中止开启流程（管理员已注册的事实保留，无害，
+    // 下次开启会直接跳过注册步），不能替一个已经取消的用户把应用重启了
+    if (snapshot.lanRegister === null) return
+    publish({ lanRegister: null })
+    publishApp({ adminRegistered: true })
+    await applyLan(true, snapshot.app.lanPanel)
+  } catch (error) {
+    publish({ lanRegister: { busy: false, error: errorMessage(error) } })
+  }
+}
+
+/** 注册步的取消：整个开启流程中止，开关保持原状（管理员若已注册就留着，无害） */
+export function cancelLanRegister(): void {
+  publish({ lanRegister: null })
+}
+
+/**
+ * 应用切换：写设置并重启（「自动补首把 Key」的判断在壳命令里，返回值据此提示）。
+ * 成功路径上应用马上重启、页面重载，这里的 toast 多半只闪一下 —— 但失败路径
+ * （写盘失败、管理员校验被拒）必须如实地把开关弹回去，靠 loadSettings 回滚。
+ */
+async function applyLan(enabled: boolean, panel: boolean): Promise<void> {
+  if (busyScope) return
+  const api = shared().workbuddyDesktop
+  if (!api?.changeLanAccess) { toast('当前环境不支持局域网访问设置', 'err'); return }
+  beginBusy('lan')
+  publishApp({ lanAccess: enabled, lanPanel: panel })
+  try {
+    const result = await api.changeLanAccess(enabled, panel) as { createdKey?: unknown } | null | undefined
+    if (result?.createdKey) toast('✅ 已自动创建网关 Key「默认」（可在「网关 Key」页查看）')
+    toast('✅ 设置已保存，应用正在重启…')
+  } catch (error) {
+    toast(`保存失败：${errorMessage(error)}`, 'err')
+    await loadSettings() // 回滚到磁盘上的真实值
   } finally {
     endBusy()
   }
@@ -885,6 +1107,106 @@ export async function saveSanitize(next: boolean): Promise<void> {
   } catch (error) {
     toast(`保存失败: ${errorMessage(error)}`, 'err')
     await loadSanitize() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
+}
+
+/* ─── Cline 伪装头（转发头的逐键覆盖）── */
+
+/** 非字符串值一律丢弃（后端只会给字符串，这里是给「形状不对的响应」兜底） */
+function asStringTable(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object') return {}
+  const out: Record<string, string> = {}
+  for (const [key, text] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof text === 'string') out[key] = text
+  }
+  return out
+}
+
+export function renderClineHeaders(data?: unknown): void {
+  if (data === undefined) return
+  if (!data || typeof data !== 'object') {
+    publish({ clineHeaders: { status: 'unavailable', defaults: {}, overrides: {}, effective: {} } })
+    return
+  }
+  const record = data as ClineHeadersData
+  publish({
+    clineHeaders: {
+      status: 'ready',
+      defaults: asStringTable(record.defaults),
+      overrides: asStringTable(record.overrides),
+      effective: asStringTable(record.effective),
+    },
+  })
+}
+
+async function loadClineHeaders(): Promise<void> {
+  try {
+    renderClineHeaders(await shared().workbuddyDesktop?.getClineHeaders())
+  } catch (error) {
+    console.warn('读取 Cline 伪装头失败:', errorMessage(error))
+    renderClineHeaders(null)
+  }
+}
+
+export async function refreshClineHeaders(): Promise<void> {
+  await loadClineHeaders()
+  toast('Cline 伪装头已刷新')
+}
+
+/**
+ * 整体替换覆盖表（与后端 PUT 同语义）：伪装头面板把编辑后的整张表提交 ——
+ * 默认行「值改回了默认」就不进表、值留空 = 该头不发、删掉的行 = 回落默认。
+ * 空表 = 全部回落默认（「恢复默认」按钮就是存一份空表）。
+ */
+export async function saveClineHeaders(overrides: Record<string, string>): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('clineHeaders')
+  try {
+    const saved = await shared().workbuddyDesktop?.saveClineHeaders(overrides)
+    renderClineHeaders(saved)
+    toast('✅ Cline 伪装头已保存')
+  } catch (error) {
+    toast(`保存失败: ${errorMessage(error)}`, 'err')
+    await loadClineHeaders() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
+}
+
+/* ─── 网关面跨域访问（/v1/* 的 CORS，默认关）── */
+
+export function renderCors(data?: unknown): void {
+  if (data === undefined) return
+  if (!data || typeof data !== 'object') {
+    publish({ cors: { status: 'unavailable', on: false } })
+    return
+  }
+  const record = data as Record<string, unknown>
+  publish({ cors: { status: 'ready', on: record.corsEnabled === true } })
+}
+
+async function loadCors(): Promise<void> {
+  try {
+    renderCors(await shared().workbuddyDesktop?.getCors())
+  } catch (error) {
+    console.warn('读取网关跨域访问设置失败:', errorMessage(error))
+    renderCors(null)
+  }
+}
+
+export async function saveCors(next: boolean): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('cors')
+  publish({ cors: { status: 'ready', on: next } })
+  try {
+    const saved = await shared().workbuddyDesktop?.saveCors(next)
+    renderCors(saved)
+    toast(next ? '网关跨域访问已开启' : '已关闭网关跨域访问')
+  } catch (error) {
+    toast(`保存失败: ${errorMessage(error)}`, 'err')
+    await loadCors() // 回滚到后端的真实值
   } finally {
     endBusy()
   }
@@ -1409,12 +1731,15 @@ export async function load(): Promise<void> {
   publish({ panelLogin: readPanelLogin() })
   await Promise.all([
     loadSettings(),
+    loadLanExtras(),
     loadRetention(),
     loadRetry(),
     loadTimeouts(),
     loadQueue(),
     loadDebug(),
     loadSanitize(),
+    loadClineHeaders(),
+    loadCors(),
     loadPrompt(),
     loadStorage(),
     loadCaptcha(),
@@ -1453,6 +1778,11 @@ export async function refreshDebug(): Promise<void> {
 export async function refreshSanitize(): Promise<void> {
   await loadSanitize()
   toast('指纹脱敏设置已刷新')
+}
+
+export async function refreshCors(): Promise<void> {
+  await loadCors()
+  toast('网关跨域访问设置已刷新')
 }
 
 export async function refreshPrompt(): Promise<void> {

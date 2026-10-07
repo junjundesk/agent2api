@@ -452,6 +452,14 @@ pub trait ProviderAdapter: Send + Sync {
             .filter(|level| !crate::server::core::model_rules::reasoning_is_off(level))
     }
 
+    /// 响应头是否表明上游错误；默认沿用 HTTP 非 2xx 的判定。
+    ///
+    /// 部分流式上游用 HTTP 200 + application/json 返回业务错误，适配器可
+    /// 在成功流交给客户端之前将它送入既有错误读取、分类与账号轮换流程。
+    fn is_error_response(&self, status: u16, _headers: &HeaderMap) -> bool {
+        !(200..300).contains(&status)
+    }
+
     /// 判定上游错误类型（status + 已解析的错误体）。
     ///
     /// `error_body` 是**已归一化**的错误对象：至少含 `code`（上游业务码，
@@ -460,6 +468,46 @@ pub trait ProviderAdapter: Send + Sync {
     /// `upstream::request::read_upstream_error`），因为「怎么读一个 HTTP 错误体」
     /// 是协议层的事、与哪一家无关。
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass;
+
+    /// 会话式转发（`attempt_stateful`）失败后的分类。
+    ///
+    /// ── 为什么这个钩子必须存在 ─────────────────────────────────
+    /// 会话式路径的错误编排历来是「一律透传（Fatal 语义）：不换账号、不冷却、
+    /// 不重试」（见 `provider_loop::attempt_stateful`）。但「透传」只该是
+    /// **编排**的默认，不该堵死分类：CodeArts 因会话准入走有状态路径，它的
+    /// 流内额度信封（HTTP 200 SSE → 首包门 403）在这条路径上永远到不了
+    /// [`Self::classify_error`]，结果福利池耗尽后每个请求都从头撞一遍全部
+    /// 账号、一个冷却标记都不落。分类本身是 provider 专属知识（403 是额度
+    /// 还是封禁，只有适配器知道），所以由适配器供给。
+    ///
+    /// ── 为什么默认是 Fatal ─────────────────────────────────────
+    /// 既有会话式家（CatPaw）的行为就是透传，默认值让它们逐字不变；
+    /// 只有明确声明「我的会话式错误里有可记账的限额」的家才覆写。
+    /// 注意编排层只取这里 QuotaLimited 的**记账**语义（标记冷却后仍按队列
+    /// 顺延）—— 不会对同一条错误再套用无状态路径的重试/刷新动作。
+    fn classify_conversation_error(&self, error: &GatewayError) -> UpstreamErrorClass {
+        UpstreamErrorClass::Fatal {
+            status: u16::try_from(error.status_code).unwrap_or(500),
+            message: error.message.clone(),
+            upstream_code: error.upstream_code,
+        }
+    }
+
+    /// 一次限额要给哪些**模型冷却键**记账。
+    ///
+    /// 默认只有本次的上游真名一条。 CodeArts 的福利池是**账号级**日额度：
+    /// 池子耗尽时该账号的全部福利模型（下一轮哪怕请求的是另一个名字）都会
+    /// 撞同样的 `insufficient quota`，只记一个键挡不住下一次顺延白撞 ——
+    /// 所以这类家返回整组真名。返回值必须是**上游真名**（与
+    /// `routing::CooldownKeys` 写读两侧同一口径），传入的 `wire_model` 就是
+    /// 本次发出去的真名。
+    ///
+    /// `account_id` 供按账号取目录的家使用（当前 CodeArts 的目录是全 provider
+    /// 共享缓存，不用它；留在签名里避免下一个这类家改签名）。
+    fn quota_cooldown_models(&self, _account_id: &str, wire_model: &str) -> Vec<String> {
+        vec![wire_model.to_string()]
+    }
+
     /// 取可用 access token（含临期主动刷新；刷新结果回写 store）。
     ///
     /// `account_id` 为空串表示「没有指定账号」：用默认登录态
@@ -908,6 +956,9 @@ pub fn usage_not_configured(provider_label: &str, field_hint: &str) -> GatewayEr
 pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
     match kind {
         ProviderKind::WorkBuddy => &super::workbuddy::WORKBUDDY_ADAPTER,
+        // WorkBuddy 的两个地区是两个 provider、两个实例（同一份实现的按地区
+        // 参数化，见 `workbuddy::region` 与 `workbuddy::adapter` 的模块头）
+        ProviderKind::WorkBuddyIntl => &super::workbuddy::WORKBUDDY_INTL_ADAPTER,
         ProviderKind::Raccoon => &super::raccoon::RACCOON_ADAPTER,
         ProviderKind::CatPaw => &super::catpaw::adapter::CATPAW_ADAPTER,
         ProviderKind::AutoClaw => &super::autoclaw::AUTOCLAW_ADAPTER,
@@ -929,6 +980,9 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         ProviderKind::Zcode => &super::zcode::adapter::ZCODE_ADAPTER,
         ProviderKind::ZcodeIntl => &super::zcode::adapter::ZCODE_INTL_ADAPTER,
         ProviderKind::Trae => &super::trae::adapter::TRAE_ADAPTER,
+        // Loomy（讯飞）：无状态 OpenAI 兼容转发（token + Bearer 双头鉴权），
+        // 账号管理走手机号验证码登录（见 `loomy/mod.rs` 的模块头）
+        ProviderKind::Loomy => &super::loomy::LOOMY_ADAPTER,
     }
 }
 
@@ -965,6 +1019,11 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
 pub fn implemented_kinds() -> Vec<ProviderKind> {
     vec![
         ProviderKind::WorkBuddy,
+        // WorkBuddy 国际版算一家：与国内版各自一份模型清单（`/v3/config` 打
+        // 各自的站点）、各自的缓存槽与刷新排期 —— 两家都必须在本列表里，
+        // 否则国际版的目录刷新永远不会被调度（症状是「国际版账号加了、
+        // 模型列表一直是内置兜底」）。
+        ProviderKind::WorkBuddyIntl,
         ProviderKind::Raccoon,
         ProviderKind::CatPaw,
         ProviderKind::AutoClaw,
@@ -990,6 +1049,10 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // 不在的话刷新循环根本不会问它，症状是"界面上点了刷新、日志里
         // 一句 trae 都没有"（与"刷了但没取到"是两种完全不同的故障）。
         ProviderKind::Trae,
+        // Loomy 已接真身（登录 / 凭据 / 目录 / 转发 / 余额 / 每日积分刷新），
+        // 且有远程目录（`GET {网关}/api/v1/models`）—— 必须在列表里，
+        // 否则目录刷新循环不会问它。
+        ProviderKind::Loomy,
     ]
 }
 
@@ -1062,14 +1125,23 @@ fn seed_current_raccoon_defaults() {
 /// 与 `seed_current_raccoon_defaults` 同理：刷新可能因失败 / 无登录态而不落地
 /// 新清单 —— 那条路径上没有种子可挂，启动后手里的这份清单（内置或旧缓存）
 /// 也要有同样的默认值。幂等：种过的 id 不会再动。
+///
+/// **两个地区各跑一遍**（拆家后各有各的清单与 provider 键）：种子按
+/// `(provider, id)` 记账，只种国内版会让国际版的新模型停在全开状态，
+/// 而两家的模型名很可能同名。
 fn seed_current_workbuddy_defaults() {
-    let ids: Vec<String> = crate::server::core::models::global_catalog()
-        .list()
-        .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
-        .collect();
-    if let Some(summary) = crate::server::core::model_rules::seed_workbuddy_defaults(&ids) {
-        crate::server::logging::log("[Models]", &summary);
+    for region in super::workbuddy::Region::ALL {
+        let ids: Vec<String> = crate::server::core::models::global_catalog(region)
+            .list()
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        if let Some(summary) = crate::server::core::model_rules::seed_workbuddy_defaults(
+            region.provider_id(),
+            &ids,
+        ) {
+            crate::server::logging::log("[Models]", &summary);
+        }
     }
 }
 

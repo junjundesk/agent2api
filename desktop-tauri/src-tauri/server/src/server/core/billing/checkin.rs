@@ -242,6 +242,16 @@ pub async fn checkin_for(
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
+        "loomy" => {
+            // Loomy 没有独立的签到接口：「每日赠送积分」由**每日首次登录**
+            // 触发刷新（`POST /api/v1/points/first-login`，见 `loomy::checkin`
+            // 的模块头）。自动签到框架对它就是「每天替账号打一次这个接口」。
+            let claim =
+                crate::server::core::providers::loomy::checkin::claim_daily_login(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
         // 兜底只服务默认那家（WorkBuddy）——**不是**「剩下所有家」。
         // 这里曾经是无所不包的 `_`：一个 provider 只要没在上面列出，就会拿自己的
         // 令牌去打腾讯的签到接口，稳定报错且看不出原因（Qoder 接入前正是这个处境）。
@@ -265,7 +275,13 @@ pub async fn checkin_for(
             "id": id,
             "name": name,
             "claim": Value::Null,
-            "error": format!("{other} 的签到链路尚未接入"),
+            // 展示名走注册表：`other` 是 provider id，直接回显会得到
+            // 「workbuddy-intl 的签到链路尚未接入」这种读不出意思的文案
+            // （拆家后这条分支会先撞上国际版）。
+            "error": format!(
+                "{} 的签到链路尚未接入",
+                crate::server::core::providers::label_of(other)
+            ),
         }),
     }
 }

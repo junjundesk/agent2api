@@ -72,6 +72,8 @@ type RequestEntry = {
   durationMs?: number; firstResponseMs?: number | null
   promptTokens?: number; completionTokens?: number; totalTokens?: number; cacheReadTokens?: number
   attempts?: number; attemptDetails?: unknown[]; sensitiveHits?: unknown[]
+  /** 模型测试发起的请求（后端 `is_test`；此前落盘的老行没有这个键） */
+  isTest?: boolean
   phase?: string; phaseElapsedMs?: number | null; phaseStartedAt?: number | null
 }
 
@@ -750,6 +752,16 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
       const attempts = Number(entry.attempts) || 1
       const identity = rowKey(entry)
       const tags: React.ReactNode[] = []
+      // 「测试」标记：这一行是模型管理页操作列那颗「测试」发起的（后端 `is_test`）。它与另外两枚
+      // 标签不同 —— **不是**悬停面板的锚点，只是一枚事实标签（brand 档，与模型表的「远程」同义），
+      // 所以不用 render 成 button。它进标签列而不是另开一列：它回答的正是「这一行是什么性质」，
+      // 与「重试 / 敏」同一类读数，而这张表的列是列设置里可拖的固定集合，为一个布尔值加一列不划算
+      if (entry.isTest) {
+        tags.push(
+          <Badge key='test' variant='brand' shape='tag'
+            title='这条明细是一次模型测试（人工发起）：走的是真实转发链路，但不计入报表统计'>测试</Badge>,
+        )
+      }
       // 判据交给悬停面板模块（它要读明细内部字段）；兜底成 attempts > 1：模块没就绪时至少换过
       // 号的请求仍能显示标签，而不是整列静默变空
       const showChain = shared().wbRequestHover?.hasProcessFacts?.(entry) ?? attempts > 1

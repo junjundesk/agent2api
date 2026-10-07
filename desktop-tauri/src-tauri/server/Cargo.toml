@@ -1,6 +1,6 @@
 [package]
 name = "agent2api-server"
-version = "2.9.0"
+version = "2.9.5"
 description = "Agent2API 网关本体 — 多提供商本地网关（桌面端与 headless 服务器共用）"
 authors = ["aimod-cc"]
 edition = "2021"
@@ -49,6 +49,10 @@ axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
 serde_yaml = "0.9"
 sha2 = "0.10"
+# Loomy 账号（CAccount）请求签名的 HMAC-SHA1（复刻客户端指纹，不是安全边界，
+# 见 providers/loomy/sign.rs）。与 sha2/md-5/hmac 同属 RustCrypto digest 0.10
+# 那条链，不引入新的哈希依赖树。
+sha1 = "0.10"
 # 「从其他工具导入」：解析 cc-switch 里 Codex 供应商的 config.toml 字符串
 # （提取激活 model_provider 的 base_url，见 core/import_ccswitch.rs）
 toml = "0.9"
@@ -96,3 +100,8 @@ bcrypt = "0.15"
 # 目标生效；其它平台该适配器的「导入桌面端登录态」是桩实现。
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_Security_Cryptography"] }
+
+[dev-dependencies]
+# 路由级测试用 `ServiceExt::oneshot` 直接打 Router（不占端口、不跑 serve），
+# 见 `server/http.rs` 的 CORS 用例。util 是 oneshot 所在的那个 feature。
+tower = { version = "0.5", features = ["util"] }

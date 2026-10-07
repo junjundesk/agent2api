@@ -58,6 +58,7 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::gateway::proxy_port;
 use crate::port_conflict::{ConflictKind, Occupant, PortConflict, StartupFailure};
+use crate::settings;
 use crate::server;
 use crate::state::AppState;
 
@@ -94,18 +95,64 @@ pub async fn is_ready(port: u16) -> bool {
 pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
     let port = proxy_port();
 
+    // ── 监听地址：本机回环（默认）或全网卡（局域网访问，issue #48）──────
+    // 与端口同属「bind 之前必须读到」的启动设置，因此也走 settings::load。
+    // 开启后的安全闸门在下面 bootstrap 之后按同一份设置装配。
+    let lan = settings::load();
+    let host = if lan.lan_access {
+        std::net::IpAddr::from([0, 0, 0, 0])
+    } else {
+        std::net::IpAddr::from([127, 0, 0, 1])
+    };
+
     // 起服务：日志库与配置在这里初始化（bootstrap 内部完成）。
     // 失败一律原样返回：`bootstrap` 只在「本该执行的目录迁移没有执行」时返回
     // Err（防御性校验，见那边的注释）—— 继续下去会把新配置目录建出来，
     // 让迁移永远无法重试，所以这里必须中断而不是带着错误往下走。
-    // 桌面形态永远只听本机回环：管理 API 不出 127.0.0.1（headless 形态
-    // 由 agent2api-server 二进制按 AGENT2API_HOST 自行决定监听地址）。
-    let state = server::ServerState::bootstrap(port, std::net::IpAddr::from([127, 0, 0, 1]))
-        .map_err(StartupFailure::other)?;
+    // 桌面形态默认只听本机回环：管理 API 不出 127.0.0.1；用户显式开启
+    // 「局域网访问」后绑 0.0.0.0，此时免鉴权语义由下面的闸门接管
+    // （headless 形态由 agent2api-server 二进制按 AGENT2API_HOST 自行决定）。
+    let mut state = server::ServerState::bootstrap(port, host).map_err(StartupFailure::other)?;
 
     // 面板访问控制的库句柄注入（桌面不注册管理员 → 该体系不启用，行为不变；
     // 与容器共用数据目录且注册过时，桌面管理 API 需要 Key —— 壳自动携带）
     server::access::attach_db(state.db().cloned());
+
+    // 管理界面（Tauri 窗口）跑在本机：OAuth 回调可以占本机登记端口，
+    // 判据与监听地址解耦 —— 开了局域网访问（0.0.0.0）后依然成立。
+    state.local_panel = true;
+
+    // ── 局域网访问的安全闸门（headless 的同款语义，见 bin/agent2api-server）──
+    // 监听一出回环，「一把 Key 都没有 → 全放行」的免鉴权语义不再成立：
+    //   · /api/*：注册过管理员就要求会话或 Key（panel_auth 分支自动生效）；
+    //     没注册过的异常态由未注册闸门兜住（除注册端点外全拒，fail-closed）。
+    //   · /v1/*：没有任何启用的 Key 时拒绝转发（额度绝不对局域网开放）。
+    // 正常路径下「先注册、后开启、重启生效」，到这里管理员必然已注册；
+    // 闸门只对绕过界面的异常态兜底。
+    if lan.lan_access {
+        server::access::set_panel_gate(true);
+        if !server::config::current().active_api_keys().is_empty() {
+            server::logging::log("[Security]", "局域网访问已开启：API Key 认证已启用");
+        } else {
+            server::access::set_v1_fail_closed(true);
+            server::logging::log(
+                "[Security]",
+                "⚠️  局域网访问已开启但尚未配置 API Key：/v1/* 暂时拒绝服务，请在「网关 Key」页创建第一把",
+            );
+        }
+        // 网页管理面板（可选）：设了 ui_dir 网关就在本端口托管 ui/ 静态目录
+        //（含网页端 bridge），远程浏览器打开 http://<本机IP>:<端口> 即面板；
+        // 不开则保持桌面形态 —— 网关只出 API，界面仍由 Tauri 壳自己出。
+        if lan.lan_panel {
+            match resolve_ui_dir(app) {
+                Some(dir) => state.set_ui_dir(dir),
+                None => server::logging::log(
+                    "[Server]",
+                    "⚠️  网页面板资源缺失：局域网面板无法托管（重装本程序可恢复），API 转发不受影响",
+                ),
+            }
+        }
+    }
 
     // 端口已被占用：唯一合法的占用者是「本产品的旧版 node 网关」（升级场景），
     // 先尝试自动接管；接管不了（别的程序 / 用户手工起的服务）才走报错。
@@ -144,7 +191,8 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
     let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
     while std::time::Instant::now() < deadline {
         if is_ready(port).await {
-            server::logging::log("[Server]", &format!("服务已就绪（127.0.0.1:{port}）"));
+            let scope = if lan.lan_access { "，局域网访问已开启" } else { "" };
+            server::logging::log("[Server]", &format!("服务已就绪（127.0.0.1:{port}{scope}）"));
             // 起来了就清掉上一次的失败记录：那条记录描述的是「之前起不来」，
             // 留着会让界面在网关正常运行时仍显示「端口被占用」——
             // 用户刚结束完进程重启，看到这个只会以为没生效。
@@ -161,6 +209,27 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
     Err(StartupFailure::other(format!(
         "服务启动超时（{port} 端口未就绪）：端口已绑定但健康检查未通过，请查看运行日志"
     )))
+}
+
+/// 局域网面板托管用的 `ui/` 静态目录（与 headless 同一份界面文件）。
+///
+/// release：tauri.conf.json 把 `../ui` 列进了 bundle resources —— 打包器会把
+/// 越出应用目录的 `..` 段映射成 `_up_`（见 tauri-utils `resources.rs` 的目标
+/// 路径规则），所以安装后落在资源目录的 `_up_/ui` 下（Windows NSIS 实测为
+/// `<install>/_up_/ui`）。只找 `ui/` 会永远找不到，面板托管随之静默降级成
+/// 「远程没界面」—— 两个候选都看一遍，把这种布局差异吃在这里。
+/// debug：资源不打包，直接指源码目录（`tauri dev` 时 ui-islands 的构建产物就
+/// 落在那里）。目录不存在返回 None —— 面板托管的缺失只是「远程没界面」，
+/// API 照常工作（headless 对 ui 缺失也是这个取舍）。
+fn resolve_ui_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
+    if cfg!(debug_assertions) {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui");
+        return dir.is_dir().then_some(dir);
+    }
+    let base = app.path().resource_dir().ok()?;
+    [base.join("_up_").join("ui"), base.join("ui")]
+        .into_iter()
+        .find(|dir| dir.is_dir())
 }
 
 /// 查端口上的监听进程（PID、镜像名、路径，以及两个身份标记）。

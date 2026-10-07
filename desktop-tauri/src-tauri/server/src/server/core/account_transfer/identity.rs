@@ -70,6 +70,15 @@ pub(super) fn is_desktop_item(item: &Map<String, Value>) -> bool {
 /// 缺字段 / null / 空串 → 历史数据兼容为 WorkBuddy（旧导出文件没有 provider）；
 /// 非空但不是注册表已知 id → Err（绝不把未知 id 当成 WorkBuddy 存进 WorkBuddy 组）。
 ///
+/// ── 拆家前的旧导出要按地区纠正（2026-10）──────────────────────
+/// WorkBuddy 拆家前只有一家，国际版账号在导出文件里长这样：
+/// `{"provider": "workbuddy", "edition": "intl", ...}`。那份 provider 字段
+/// 描述的是「旧版本里唯一的那一家」，不是「这条账号属于国内版」——
+/// 照字面导进去会把国际版账号塞回国内版组（凭证是国际版的，转发会稳定打错
+/// 站点），因此这里按记录自己的 `edition` 归位。国内版（含 edition 缺失）
+/// 归位结果仍是 `workbuddy`，行为逐字不变；显式写了 `workbuddy-intl` 的
+/// 新导出不受影响（那已经是拆家后的权威归属）。
+///
 /// **例外：`custom-` 前缀**（自定义提供商）。它是运行期数据、刻意不进注册表
 /// （见 `custom_providers` 模块头），按注册表判会被整条拒掉 —— 那正是自定义
 /// 账号「导得出、导不回」的根子。这里放行前缀，存在性校验由调用方在合并完
@@ -88,6 +97,12 @@ pub(super) fn resolve_provider(item: &Map<String, Value>) -> Result<String, Stri
                 return Err(format!(
                     "未知的提供商 id「{trimmed}」：注册表不认识，不能当作 WorkBuddy 导入"
                 ));
+            }
+            if trimmed == DEFAULT_PROVIDER_ID {
+                let region = crate::server::core::providers::workbuddy::Region::from_edition_id(
+                    item.get("edition").and_then(Value::as_str),
+                );
+                return Ok(region.provider_id().to_string());
             }
             Ok(trimmed.to_string())
         }
@@ -131,7 +146,9 @@ pub(super) fn identity_of_item(provider: &str, item: &Map<String, Value>) -> Res
     let uid = text("uid");
     let login_name = text("loginName");
     let user_id = text("userId");
-    if provider == kind_id(ProviderKind::WorkBuddy) {
+    // 「workbuddy 系」= 国内版 + 国际版：两家身份字段同形（uid），
+    // 见 `providers::workbuddy::is_workbuddy_family` 的说明
+    if crate::server::core::providers::workbuddy::is_workbuddy_family(provider) {
         if uid.is_empty() {
             return Err("缺少 uid（无法标识 WorkBuddy 账号）".to_string());
         }
@@ -223,7 +240,7 @@ pub(super) fn identity_of_record(provider: &str, record: &StoredAccount) -> Opti
         .unwrap_or("")
         .trim()
         .to_string();
-    if provider == kind_id(ProviderKind::WorkBuddy) {
+    if crate::server::core::providers::workbuddy::is_workbuddy_family(provider) {
         let uid = record.uid().trim().to_string();
         return (!uid.is_empty()).then_some(uid);
     }

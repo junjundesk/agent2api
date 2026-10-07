@@ -103,13 +103,26 @@ pub struct AppSettings {
     /// 服务端 bind 之前就读到，属于「应用级启动设置」而非网关业务配置。
     /// 改这个值需要重启进程才生效（服务端 bind 之后端口改不了）。
     pub proxy_port: u16,
+    /// 允许局域网访问：监听 `0.0.0.0` 而不是 `127.0.0.1`（issue #48）。
+    ///
+    /// 默认 false（单机安全边界，桌面壳的历史语义）。开启的前提是面板管理员
+    /// 已注册（`change_lan_access` 命令把关）：监听地址一旦出了回环，`/api/*`
+    /// 的免鉴权语义不再成立，必须靠管理员会话 + API Key 认证兜底 —— 这套
+    /// 闸门在 `backend::ensure_ready` 里按本字段开启。
+    /// 改这个值需要重启进程才生效（监听地址在 bind 之后就改不了）。
+    pub lan_access: bool,
+    /// 局域网访问开启时是否同时托管网页管理面板（网关端口出 `ui/` 静态目录，
+    /// 远程浏览器可打开面板管理；远程登录走面板自己的管理员注册 / 登录）。
+    /// 默认 false：桌面端是电脑端应用，只把 `/v1/*` 网关出给局域网，
+    /// 面板仍由 Tauri 壳自己出。仅在本字段为 true 时有意义。
+    pub lan_panel: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         // 关闭到托盘默认开启：网关的价值在于后台持续转发，
         // 用户点关闭通常只是想收起界面，而不是让转发中断
-        Self { close_to_tray: true, autostart: false, proxy_port: 0 }
+        Self { close_to_tray: true, autostart: false, proxy_port: 0, lan_access: false, lan_panel: false }
     }
 }
 

@@ -177,11 +177,13 @@ struct LegacyAppSettings {
     _close_to_tray: bool,
     _autostart: bool,
     _proxy_port: u16,
+    _lan_access: bool,
+    _lan_panel: bool,
 }
 
 impl Default for LegacyAppSettings {
     fn default() -> Self {
-        Self { _close_to_tray: true, _autostart: false, _proxy_port: 0 }
+        Self { _close_to_tray: true, _autostart: false, _proxy_port: 0, _lan_access: false, _lan_panel: false }
     }
 }
 

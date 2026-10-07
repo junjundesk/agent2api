@@ -9,7 +9,8 @@
  * 本文件只放**视图层**（页面骨架 + 左栏 + 模型表 + 映射 / 添加模型两个弹窗 + 挂载）；
  * 数据层（快照 store / 取数 / 写入 / 对外契约）在 models-panel-state.ts —— 那个文件不是岛
  * （.ts，不被 glob 加载）；「模型能力」弹窗自带一个文件（model-capability-dialog.tsx，它只
- * 依赖数据层，不依赖本文件）。
+ * 依赖数据层，不依赖本文件），操作列那颗「测试」的两层弹窗同样自带一个文件
+ * （model-test-dialog.tsx：门禁判定 `testBlockReason` 与弹窗本体都在那边，本页只挂载）。
  *
  * ── 一个页面，两种数据源 ──────────────────────────────
  * 左栏（`.prov-rail`）是提供商导航：**内置提供商**一组（「全部」= 各家的聚合视图，各家是
@@ -51,6 +52,7 @@
  * 2xs / icon-2xs 档）、「＋ 映射」（Button variant='dashed'）、模型 ID 的复制按钮、展开/收起、
  * 行内「移除」、来源徽标（Badge）、三个弹窗整块（Dialog 一族 + Input / Select / Label / Tooltip；
  * 「模型能力」在 model-capability-dialog.tsx，能力位两列的单元格样式在 page-gateway.css）。
+ * 操作列的「测试」也是组件库按钮，它的弹窗整块在 model-test-dialog.tsx（含那两条门禁）。
  * 保留旧实现的两处都不是控件本身：
  *   · 自定义家条目外层的 `.pv-row` 定位容器与那颗 `.pv-del` —— HTML 不允许 button 嵌套，
  *     删除 × 必须与 NavItem 做兄弟节点，靠 .pv-row 定位（见 rail 里的说明）；
@@ -97,6 +99,7 @@ import {
   exactTokens, formatTokens, normalizeOverrides,
 } from './model-capability'
 import { CapabilityDialog } from './model-capability-dialog'
+import { ModelTestDialog, testBlockReason, type ModelTestTarget } from './model-test-dialog'
 import { CUSTOM_LEVEL, levels as reasoningLevels } from './models-reasoning'
 import * as customSource from './models-custom-source'
 import type { ManageModel, ManageView } from './models-custom-source'
@@ -147,6 +150,12 @@ function ModelsPage() {
   const state = React.useSyncExternalStore(subscribe, getSnapshot)
   const provider = resolveProvider(state)
   const custom = customSource.isCustom(provider)
+  /**
+   * 「测试」弹窗的目标行。这一份状态刻意**不放进模块级快照**（与三个弹窗的 context 不同）：
+   * 它只被本页用、也没有从 React 之外打开的调用点（入口就是表格里那颗按钮），
+   * 放在组件里就够了。值为 null = 弹窗关着。
+   */
+  const [testTarget, setTestTarget] = React.useState<ModelTestTarget | null>(null)
   /** 选中了一个已被删除的自定义家（目录缓存里确实没有这条记录，而不是「还没加载完」） */
   const customMissing = custom && directoryReady() && !customSource.record(provider)
 
@@ -449,10 +458,18 @@ function ModelsPage() {
         return <td className={cellClass('cell-caps', column.align)}>{capsCell(model)}</td>
       case 'alias':
         return <td className={cellClass('cell-alias', column.align)}>{aliasCell(model)}</td>
-      case 'act':
+      case 'act': {
+        // 「测试」的两条门禁（映射全关 / 该家没有可用账号）由 model-test-dialog 统一判定，
+        // 这里只把理由挂到 title 上 —— 禁用而不说原因等于让用户猜
+        const blocked = testBlockReason(model.provider || '', model)
         return (
           <td className={cellClass('cell-act r', column.align)}>
             <div className='row-actions'>
+              <Button variant='ghost' size='sm' disabled={Boolean(blocked)}
+                title={blocked || '以这个上游模型发一次最小请求，走真实转发链路'}
+                onClick={() => setTestTarget({ provider: model.provider || '', id: model.id })}>
+                测试
+              </Button>
               {model.source === 'manual' || custom ? (
                 <Button variant='ghost' size='sm' className='text-destructive' disabled={busyRow}
                   onClick={() => void confirmRemoveModel()}>移除</Button>
@@ -460,6 +477,7 @@ function ModelsPage() {
             </div>
           </td>
         )
+      }
       default:
         return null
     }
@@ -642,6 +660,9 @@ function ModelsPage() {
         : null}
       {state.capability
         ? <CapabilityDialog context={state.capability} onClose={closeCapability} />
+        : null}
+      {testTarget
+        ? <ModelTestDialog target={testTarget} onClose={() => setTestTarget(null)} />
         : null}
     </>
   )

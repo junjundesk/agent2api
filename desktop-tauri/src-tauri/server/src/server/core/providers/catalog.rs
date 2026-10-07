@@ -15,7 +15,8 @@ use crate::server::core::models::{model_id, ModelCatalog};
 use crate::server::core::providers::adapter::adapter_for;
 use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind, PROVIDERS};
 
-use super::autoclaw::region::Region;
+use super::autoclaw::region::Region as AutoclawRegion;
+use super::workbuddy::Region as WorkBuddyRegion;
 
 pub use routing::{
     default_model_catalog, default_model_usable, forwarding_providers, model_blocked_everywhere,
@@ -50,11 +51,11 @@ fn advertised_manifest_for(store: &AccountStore, kind: ProviderKind) -> Vec<Valu
     adapter_for(kind).advertise_models(store, manifest_for(kind))
 }
 
-fn workbuddy_catalog() -> ModelCatalog {
-    crate::server::core::models::global_catalog()
+fn workbuddy_catalog(region: WorkBuddyRegion) -> ModelCatalog {
+    crate::server::core::models::global_catalog(region)
 }
 
-fn autoclaw_catalog_state(region: Region) -> (bool, i64) {
+fn autoclaw_catalog_state(region: AutoclawRegion) -> (bool, i64) {
     (
         !super::autoclaw::catalog::remote_models(region).is_empty(),
         super::autoclaw::catalog::last_refreshed_at(region),
@@ -66,14 +67,21 @@ fn autoclaw_catalog_state(region: Region) -> (bool, i64) {
 /// 两个消费方：本模块的对外视图（`meta.source` / 管理页的「来源」列）与
 /// **适配器层的手动刷新结果**（`adapter::refresh_implemented_forced` 的
 /// `refreshedAt`，界面「更新日期」列读它）—— 后者必须走这里而不是自己按
-/// kind 拼一遍：十家的取值路径（workbuddy 的全局目录、按地区分格的三家、
+/// kind 拼一遍：十家的取值路径（workbuddy 按地区分格、按地区分格的三家、
 /// Cline 的池）各不相同，抄一份就是一处会漂移的知识。
 pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
     match kind {
-        ProviderKind::WorkBuddy => (
-            workbuddy_catalog().remote_refreshed(),
-            workbuddy_catalog().last_refreshed_at(),
-        ),
+        // WorkBuddy 的两个地区各有自己的目录实例与缓存槽（见
+        // `providers::workbuddy::region` 的模块头）：这一处也是两家分开的
+        // 语义来源之一 —— 界面「更新日期」列因此如实显示各自那次拉取。
+        ProviderKind::WorkBuddy => {
+            let catalog = workbuddy_catalog(WorkBuddyRegion::Cn);
+            (catalog.remote_refreshed(), catalog.last_refreshed_at())
+        }
+        ProviderKind::WorkBuddyIntl => {
+            let catalog = workbuddy_catalog(WorkBuddyRegion::Intl);
+            (catalog.remote_refreshed(), catalog.last_refreshed_at())
+        }
         ProviderKind::Raccoon => (
             super::raccoon::models::remote_refreshed(),
             super::raccoon::models::last_refreshed_at(),
@@ -91,8 +99,8 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             !super::catpaw::catalog::remote_models().is_empty(),
             super::catpaw::catalog::last_refreshed_at(),
         ),
-        ProviderKind::AutoClaw => autoclaw_catalog_state(Region::Cn),
-        ProviderKind::AutoClawIntl => autoclaw_catalog_state(Region::Intl),
+        ProviderKind::AutoClaw => autoclaw_catalog_state(AutoclawRegion::Cn),
+        ProviderKind::AutoClawIntl => autoclaw_catalog_state(AutoclawRegion::Intl),
         ProviderKind::ClineFree | ProviderKind::ClinePass => (
             super::cline::models::remote_refreshed(),
             super::cline::models::last_refreshed_at(),
@@ -118,6 +126,12 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
         ProviderKind::Trae => (
             super::trae::models::remote_refreshed(),
             super::trae::models::last_refreshed_at(),
+        ),
+        // Loomy 的清单来自 `GET {集成网关}/api/v1/models`（OpenAI 格式）。
+        // 上游**没有**内置兜底清单，所以「有内容」就等于「远程拉到过」。
+        ProviderKind::Loomy => (
+            super::loomy::models::remote_refreshed(),
+            super::loomy::models::last_refreshed_at(),
         ),
     }
 }

@@ -4,29 +4,25 @@
 
 把多家 AI 桌面客户端的登录态包装成本地 **OpenAI 兼容 API 网关**，统一暴露一个 `base_url`，附带多提供商账号管理、模型管理（启停 / 删除 / 映射）、出站指纹脱敏、出网代理与请求报表，并提供一个开箱即用的 Tauri 桌面端。任何支持自定义 `base_url` 的 OpenAI 客户端都能以 `http://127.0.0.1:3065/v1` 为端点调用这几家的模型额度——不需要 API Key，不需要改客户端源码。
 
-```
-OpenAI 客户端 / 任意 SDK
-        │  POST /v1/chat/completions   （OpenAI 兼容，SSE）
-        ▼
-  Agent2API 网关（Rust 进程内服务）              ← 本机 127.0.0.1:3065
-  模型映射 · 账号候选链（全局优先级）· 429 降级 · 出网代理 · 出站指纹脱敏
-        │  HTTPS（按模型名决定去谁家）
-        ├──▶ workbuddy  copilot.tencent.com（国内版）/ www.workbuddy.ai（国际版）
-        ├──▶ raccoon    xiaohuanxiong.com/api/web/llm/v2 · Authorization: Bearer <JWT>
-        ├──▶ catpaw     ai.catpaw.meituan.com · Cookie: X-Passport-Token=… + user-uid
-        │                （自有 conversation 会话协议）
-        ├──▶ autoclaw   autoglm-acceleration-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw
-        │                （国内版）X-Authorization: Bearer <token>（OpenAI 兼容）
-        ├──▶ autoclaw-intl  autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw
-        │                （国际版）同一套协议与签名指纹，站点不同
-        ├──▶ qoder      api3.qoder.sh（国际版）/ gateway.qoder.com.cn（中国版）
-        │                COSY 自签名头（不是 Bearer）· 信封式 SSE（自有编码与签名）
-        └──▶ cline      api.cline.bot · Authorization: Bearer workos:<JWT>
-                         X-CLIENT-TYPE: cline-sdk（缺了它免费池模型一律 403）
-                         模型名带池前缀：cline-pass/…（订阅池）· cline-free/…（免费池）
-                         （免费池另有两条不带前缀的裸 id：z-ai/glm-5.3-flash、
-                           poolside/laguna-s-2.1:free，归池按上游分组而非前缀）
-```
+各平台的反代能力一览（✓ 支持 · ✗ 不支持 · — 无此概念或不适用）：
+
+| 平台 | LLM 请求 | Token 自动续期 | 模型列表（远程刷新） | 余额查询 | 签到 | 领取类 |
+| --- | :--: | :--: | :--: | :--: | :--: | :--: |
+| WorkBuddy 国内版 | ✓ | ✓ | ✓ 远程 + 静态兜底 | ✓ | ✓ 每日签到 | — |
+| WorkBuddy 国际版 | ✓ | ✓ | ✓ 远程 + 静态兜底 | ✓ | ✗ 无签到活动 | — |
+| 小浣熊 | ✓ | ✓ | ✓ 远程 + 静态兜底 | ✓ | ✓ 桌面登录积分 | — |
+| CatPaw | ✓ | ✗ 无刷新机制 | ✓ 远程 + 静态兜底 | ✓ | ✗ | — |
+| AutoClaw（国内版 / 国际版） | ✓ | ✓ | ✓ 远程 + 静态兜底 | ✓ | ✓ 每日签到 | — |
+| Qoder | ✓ | ✓ | ✓ 远程（按地区）+ 静态兜底 | ✓ | ✓ 仅中国版 | — |
+| Cline（Free / Pass） | ✓ | ✓ | ✓ 远程 + 静态兜底 | ✓ | — | — |
+| Accio（国际版 / 国内版） | ✓ | ✓ | ✓ 远程 + 静态兜底 | ✓ 用量百分比 | — | — |
+| ZCode（国内版 / 国际版） | ✓ | ✗ | ✗ 静态表 | ✓ 套餐余额 | — | ✓ 限时套餐（手动） |
+| CodeArts | ✓ | ✓ 一次性轮换 | ✓ 远程（三源合并） | ✓ 两份账 | — | ✓ 每日福利（手动） |
+| Trae | ✓ | ✓ 一次一换 | ✓ 仅远程 | ✓ 两份账 | — | — |
+| Loomy（讯飞） | ✓ | ✗ 无续期接口 | ✓ 仅远程 | ✓ 两份积分账 | ✓ 每日赠送积分刷新 | — |
+| 自定义提供商 | ✓ Chat 透传 / Responses / Anthropic | — | ✓ 手动登记 + 服务端拉取 | — | — | — |
+
+三条对话协议入口（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`，另含 `/v1/messages/count_tokens`）与 `/v1/models` 对所有平台一视同仁，差异只在各家上游能不能做到表里那些事；模型映射、全局优先级队列、429 降级、出网代理、出站指纹脱敏与请求报表同样对全平台通用。
 
 > [!IMPORTANT]
 > **这是 [aimod-cc/agent2api](https://github.com/aimod-cc/agent2api) 的 fork，与上游的差别只有一处：**
@@ -34,7 +30,7 @@ OpenAI 客户端 / 任意 SDK
 
 > **本项目仅供学习与交流使用。** 它通过本地反向代理复用你自己账号的登录态，这种「以非官方客户端形态转发」的方式可能不符合上游服务的用户协议，使用风险（含账号被风控、封禁）由使用者自行承担；禁止用于商业用途或绕过计费。详见[使用声明](#使用声明)与 [LICENSE](./LICENSE)。
 >
-> 本项目是个人用途的本地代理工具，与腾讯（WorkBuddy）、美团（CatPaw）、商汤（小浣熊）、智谱（AutoClaw/autoglm）、阿里巴巴（Qoder / Accio）、华为云（CodeArts）、字节跳动（Trae）、Cline 及其官方产品均无关；所有接口形态来自对各家桌面端通信的观察，上游随时可能调整。
+> 本项目是个人用途的本地代理工具，与腾讯（WorkBuddy）、美团（CatPaw）、商汤（小浣熊）、智谱（AutoClaw/autoglm）、阿里巴巴（Qoder / Accio）、华为云（CodeArts）、字节跳动（Trae）、科大讯飞（Loomy）、Cline 及其官方产品均无关；所有接口形态来自对各家桌面端通信的观察，上游随时可能调整。
 
 ---
 
@@ -55,7 +51,7 @@ OpenAI 客户端 / 任意 SDK
 从 Releases 下载安装包（NSIS，简体中文，默认装到 `C:\Program Files\Agent2API`，安装时需要管理员授权），安装后启动即可，**无需安装 Node 或任何其它运行时**。
 
 1. 首次启动即在应用进程内启动本机网关（端口 3065）并打开主窗口；若检测到旧版本的数据目录或数据文件，会弹窗提示迁移，按指引操作即可。
-2. 点「账号」页的「添加账号」，选提供商（WorkBuddy / 小浣熊 / CatPaw / AutoClaw 国内版 / AutoClaw 国际版 / Qoder / Cline / Accio 国际版 / Accio 国内版 / CodeArts / Trae），再按该家支持的方式完成登录或填写凭证：网页登录、手机验证码、粘贴凭证，或导入本机桌面端登录态（导入不落 token，客户端重新登录后网关自动跟上；CodeArts 与 Trae 只有网页登录与粘贴凭证两种）。
+2. 点「账号」页的「添加账号」，选提供商（WorkBuddy / 小浣熊 / CatPaw / AutoClaw 国内版 / AutoClaw 国际版 / Qoder / Cline / Accio 国际版 / Accio 国内版 / ZCode 国内版 / ZCode 国际版 / CodeArts / Trae / Loomy），再按该家支持的方式完成登录或填写凭证：网页登录、手机验证码、粘贴凭证，或导入本机桌面端登录态（导入不落 token，客户端重新登录后网关自动跟上；CodeArts 与 Trae 只有网页登录与粘贴凭证两种，Loomy 只有手机验证码与粘贴 session 两种）。
 3. 把 OpenAI 客户端的 `base_url` 填成 `http://127.0.0.1:3065/v1`，`api_key` 随便填（例如 `sk-local`，未启用鉴权时服务端不校验）。
 
 关闭窗口默认只是最小化到托盘，网关继续在后台转发；要彻底退出请在托盘图标上右键选「退出」。
@@ -87,6 +83,12 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)
 ```
+
+**浏览器里的页面**（自建 Web UI、单文件前端应用等）用 `fetch` 直连这个端点时，会因为跨源预检被拒而报「无法连接 API」：网关面默认**不应答 CORS**，预检请求（OPTIONS）会落到 API Key 校验上得到 401（跨源预检按规范不携带 `Authorization` 头），请求根本发不出去。两种解法：① 在设置页「安全 → 网关跨域访问」里打开它，网关随即按面板的同一口径应答（预检放行、响应带 `Access-Control-Allow-*`，来源 `*`，立即生效）—— 注意网关是真正转发上游、消耗额度的那一面，开着 `*` 又没配 API Key 时任何网页都能借本机网关打上游，建议同时配置「网关 Key」；② 让页面与网关同源 —— 用一个本地静态服务同时托管页面并把 `/v1` 反代到 `127.0.0.1:3065`，这样连跨域都不存在，不需要放开任何东西。
+
+### 局域网访问
+
+默认网关只监听 `127.0.0.1`，只有本机能用。在「设置 → 通用 → 局域网访问」开启后，网关改听所有网卡，同一局域网内的设备把 API 地址指向本机 IP（界面上会给出完整地址，如 `http://192.168.1.5:3065/v1`）即可共用这套账号。出于安全考虑，开启前必须注册一个面板管理员：管理接口从此要求管理员会话或网关 Key，一把启用的 Key 都没有时转发接口也会拒绝服务（开启流程会自动补一把「默认」Key）。还可以选择把网页管理面板一并开放给局域网（其他设备的浏览器打开本机 IP 即可管理，需管理员登录）；默认不开放，桌面端的面板只由本程序自己出。改动随应用重启生效。
 
 ---
 
@@ -126,7 +128,7 @@ services:
 
 从源码构建：克隆本仓库后 `docker compose up -d --build`（镜像里只有网关与面板，不含 Rust 工具链）。
 
-**网页端功能差异**（都源于「没有本机桌面客户端」）：网页登录（WorkBuddy / Qoder / Cline）、手机验证码、粘贴凭证完全可用；AutoClaw / CatPaw / Accio / CodeArts / Trae 网页登录的回调打本机端口，远程面板请改用粘贴凭证；小浣熊网页登录与「导入本机桌面端登录态」不可用（用填写凭证；CodeArts 与 Trae 本来也没有桌面端登录态可导入）。
+**网页端功能差异**（都源于「没有本机桌面客户端」）：网页登录（WorkBuddy / Qoder / Cline）、手机验证码、粘贴凭证完全可用；AutoClaw / CatPaw / Accio / CodeArts / Trae 网页登录的回调打本机端口，远程面板请改用粘贴凭证；小浣熊网页登录与「导入本机桌面端登录态」不可用（用填写凭证；Loomy / CodeArts / Trae 本来也没有桌面端登录态可导入）。
 
 ---
 
@@ -220,13 +222,17 @@ agent2api/
 │  │  │  │  │  │                models（agent / builtin / 福利网关三源合并）/
 │  │  │  │  │  │                balance（订阅统计 + 福利网关两份账）/
 │  │  │  │  │  │                welfare（每日福利领取：幂等键先落盘、回读二次确认）
-│  │  │  │  │  └─ trae/         Trae（字节 AI IDE SOLO 通道）：credentials / device（设备密钥对）/
+│  │  │  │  │  ├─ trae/         Trae（字节 AI IDE SOLO 通道）：credentials / device（设备密钥对）/
 │  │  │  │  │                   login + oauth（PKCE 网页登录 + 换证候选）/ callback_server
 │  │  │  │  │                   （本机随机端口回调与噪音过滤）/ refresh（单飞续期）/
 │  │  │  │  │                   payload（SOLO 信封白名单重建）/ headers（SOLO 头集合）/
 │  │  │  │  │                   stream（SSE→chunk 翻译）/ forward（有状态转发）/
 │  │  │  │  │                   errors（错误分类与死配置名单）/ models（get_detail_param 目录）/
 │  │  │  │  │                   usage（权益包 + 套餐 quota 两份账）/ profile（身份解析）
+│  │  │  │  │  └─ loomy/        Loomy（讯飞）：login（手机验证码）/ credentials（session 14 天、无续期接口）/
+│  │  │  │  │                   sign（复刻客户端 HMAC-SHA1 签名头）/ endpoints / client（集成网关）/
+│  │  │  │  │                   models（/api/v1/models 远程目录，上游无内置兜底清单）/
+│  │  │  │  │                   balance（永久积分 + 每日赠送两份账）/ checkin（每日首次登录刷新赠送积分）
 │  │  │  │  ├─ upstream/        转发编排：全局账号队列循环（provider_loop）+ 发送体处理
 │  │  │  │  │                    （payload）+ SSE 透传/聚合 + usage 旁路提取
 │  │  │  │  ├─ account_store/   账号存储（全局优先级、限额冷却、各家添加与导入）
@@ -294,7 +300,7 @@ npm run build:icon         # 生成图标源图（改图标设计后执行，再
 
 ### 仅供学习与交流
 
-本项目是一个用于学习 HTTP 反向代理、SSE 流式透传、多上游协议适配与桌面端打包（Tauri）等技术主题的实践项目，**仅供个人学习与研究使用**。它不是官方产品，与腾讯公司及 WorkBuddy / CodeBuddy、美团及 CatPaw、商汤及小浣熊、智谱及 AutoClaw / autoglm、阿里巴巴及 Qoder / Accio、华为云及 CodeArts、字节跳动及 Trae 均无任何关联，未获得其授权、认可或赞助。
+本项目是一个用于学习 HTTP 反向代理、SSE 流式透传、多上游协议适配与桌面端打包（Tauri）等技术主题的实践项目，**仅供个人学习与研究使用**。它不是官方产品，与腾讯公司及 WorkBuddy / CodeBuddy、美团及 CatPaw、商汤及小浣熊、智谱及 AutoClaw / autoglm、阿里巴巴及 Qoder / Accio、华为云及 CodeArts、字节跳动及 Trae、科大讯飞及 Loomy 均无任何关联，未获得其授权、认可或赞助。
 
 ### 关于反向代理行为
 

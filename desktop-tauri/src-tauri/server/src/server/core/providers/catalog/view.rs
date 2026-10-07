@@ -14,6 +14,29 @@ use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind};
 use super::routing::{builtin_target, entry_id_in_manifest};
 use super::{active_manifests, aggregate_source, manifest_for, refresh_meta};
 
+/// 一家会对外广告哪些名字：清单里原生的上游 id + **已启用**的映射别名。
+///
+/// ── `enabled` 这一道过滤不能少（曾经的漏洞）──────────────────
+/// 漏掉它时，被关掉的别名仍会进候选名，然后在 [`builtin_target`] 里绕开
+/// 「映射分支」的启停判定走另一条路：`entry_id_in_manifest` 按 id 找不到会
+/// **回落到比对上一条目的展示名（`name`）**，命中后按 `default_enabled` 判定
+/// —— 那与别名映射的开关无关。于是「关了映射、`/v1/models` 里却还在」。
+/// 实测：`space-bunny-alpha`（与展示名逐字相同）会中，`mimo-v2.6-flash`
+/// （展示名是 `Mimo V2.6 Flash`，比不中）不会中 —— 同一个开关两种结果。
+/// 模块头那句「所有对外出口使用相同的开启绑定集合」说的就是这里必须过滤。
+fn advertised_names(
+    rules: &model_rules::ModelRules,
+    provider: &str,
+    manifest: &[Value],
+) -> Vec<String> {
+    let mut names: Vec<String> = manifest.iter().map(model_id).collect();
+    names.extend(rules.mappings.iter()
+        .filter(|mapping| mapping.enabled)
+        .filter(|mapping| mapping.provider.as_deref().map_or(true, |owner| owner == provider))
+        .map(|mapping| mapping.alias.clone()));
+    names
+}
+
 /// 先在各提供商内判断绑定，再按对外名去重；不能先合并上游 ID 再拼别名，
 /// 否则某家关闭的映射会借另一家的同名上游重新出现在列表中。
 fn public_builtin_items(active: &[(ProviderKind, Vec<Value>)]) -> Vec<(String, Value)> {
@@ -22,10 +45,7 @@ fn public_builtin_items(active: &[(ProviderKind, Vec<Value>)]) -> Vec<(String, V
     let mut result = Vec::new();
     for (kind, manifest) in active {
         let provider = kind_id(*kind);
-        let mut names: Vec<String> = manifest.iter().map(model_id).collect();
-        names.extend(rules.mappings.iter()
-            .filter(|mapping| mapping.provider.as_deref().map_or(true, |owner| owner == provider))
-            .map(|mapping| mapping.alias.clone()));
+        let names = advertised_names(&rules, provider, manifest);
         for name in names {
             let Some(wire) = builtin_target(&rules, *kind, manifest, &name) else { continue };
             if !claimed.insert(name.to_lowercase()) {
@@ -180,6 +200,13 @@ pub fn manage_view(store: &AccountStore) -> Value {
                 "source": source, "enabled": enabled, "aliases": aliases,
                 "capabilities": capability::effective(&item),
                 "capOverrides": cap_overrides,
+                // 模型**自己能配哪些思考档位**（清单项里的可选键，只有给过依据
+                // 的家才有 —— 目前是 ZCode 的 GLM-5.3 家族，数据来自官方目录）。
+                // 与上面 `mappings[].reasoning`（用户给某条映射**指定**的档位）
+                // 是两件事：这里回答「这个模型支持哪些档」，那里回答「这条映射
+                // 用哪一档」。缺失（null）= 该模型未声明，界面据此不显示这一行。
+                "reasoningLevels": item.get("reasoningLevels"),
+                "reasoningDefaultLevel": item.get("reasoningDefaultLevel"),
                 // 这一家的清单是什么时候拉到的（毫秒；0 = 从未成功拉过）。
                 // 缓存恢复的清单与刚拉的清单**都是 `remote`**，时效只能靠这个
                 // 时间戳说明（见 `providers::catalog_cache` 的模块头）。
@@ -203,4 +230,71 @@ pub fn manage_view(store: &AccountStore) -> Value {
         }));
     }
     json!({ "models": models, "mappings": mappings, "reasoningLevels": model_rules::REASONING_LEVELS })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `from_raw` 收的是整份 config（它自己取 `modelRules` 键），所以包一层
+    fn rules_with(mappings: Value) -> model_rules::ModelRules {
+        let raw = json!({ "modelRules": { "mappings": mappings } });
+        model_rules::ModelRules::from_raw(raw.as_object().expect("对象字面量"))
+    }
+
+    /// 一条展示名与别名逐字相同的上游条目（`space-bunny-alpha` 是实测命中的那个）
+    fn manifest() -> Vec<Value> {
+        vec![json!({ "id": "stealth/space-bunny-alpha", "name": "space-bunny-alpha" })]
+    }
+
+    /// 被关掉的映射别名不能进广告候选名。漏了这道过滤时，别名会经由
+    /// `builtin_target` 的「展示名回落」绕开启停判定 —— 于是「关了映射，
+    /// `/v1/models` 里却还在」（2026-10-03 实测复现）。
+    #[test]
+    fn disabled_mapping_alias_is_not_advertised() {
+        let rules = rules_with(json!([
+            { "alias": "space-bunny-alpha", "target": "stealth/space-bunny-alpha",
+              "provider": "cline-free", "enabled": false }
+        ]));
+        let names = advertised_names(&rules, "cline-free", &manifest());
+        assert!(
+            !names.iter().any(|name| name == "space-bunny-alpha"),
+            "关掉的别名不该出现在候选名里: {names:?}"
+        );
+        // 原生 id 不受影响（开关只管别名）
+        assert!(names.iter().any(|name| name == "stealth/space-bunny-alpha"));
+    }
+
+    /// 开着的映射别名照旧进候选 —— 不能让这次修复把功能一起修没
+    #[test]
+    fn enabled_mapping_alias_is_advertised() {
+        let rules = rules_with(json!([
+            { "alias": "space-bunny-alpha", "target": "stealth/space-bunny-alpha",
+              "provider": "cline-free", "enabled": true }
+        ]));
+        let names = advertised_names(&rules, "cline-free", &manifest());
+        assert!(names.iter().any(|name| name == "space-bunny-alpha"));
+    }
+
+    /// 缺 `enabled` 键 = 开关功能上线前的历史条目 = 默认启用（升级不改行为）
+    #[test]
+    fn mapping_without_enabled_key_is_advertised() {
+        let rules = rules_with(json!([
+            { "alias": "space-bunny-alpha", "target": "stealth/space-bunny-alpha",
+              "provider": "cline-free" }
+        ]));
+        let names = advertised_names(&rules, "cline-free", &manifest());
+        assert!(names.iter().any(|name| name == "space-bunny-alpha"));
+    }
+
+    /// 别家的映射别名不该混进这一家的候选（provider 过滤仍在）
+    #[test]
+    fn other_providers_alias_is_not_included() {
+        let rules = rules_with(json!([
+            { "alias": "x-alias", "target": "stealth/space-bunny-alpha",
+              "provider": "workbuddy", "enabled": true }
+        ]));
+        let names = advertised_names(&rules, "cline-free", &manifest());
+        assert!(!names.iter().any(|name| name == "x-alias"));
+    }
 }

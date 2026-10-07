@@ -108,6 +108,8 @@ type RequestRow = {
   accountName?: unknown
   attemptDetails?: AttemptDetail[]
   sensitiveHits?: SensitiveHit[]
+  /** 模型测试发起的请求（后端 `is_test` 透传到列表行；老行没有这个键） */
+  isTest?: boolean
 } & ProviderFields
 
 /** 下游原文响应（预览对话）与上游调试报文（四段 + meta）：字段都按 unknown 收，用前归一 */
@@ -470,6 +472,16 @@ function DetailPane({ row }: { row: RequestRow | null }) {
           输入 {fmtTokens(row.promptTokens)} · 输出 {fmtTokens(row.completionTokens)} · 总计{' '}
           {fmtTokens(row.totalTokens)} · 缓存读 {fmtTokens(row.cacheReadTokens)}
         </Field>
+        {/* 测试发起的请求**按需多一行**：它是这一条明细的性质（走的是真实转发链路、但不进报表），
+            正常转发的行不必为此多读一行「正常转发」 —— 那种字段每个租户都有时等于没有 */}
+        {row.isTest ? (
+          <Field label='来源'>
+            <Badge variant='brand' shape='tag'
+              title='模型管理页操作列那颗「测试」发起的请求：与真实请求同一条转发链路，但不计入报表统计'>
+              模型测试
+            </Badge>
+          </Field>
+        ) : null}
         <Field label='错误'>
           {row.error ? <span className='text-destructive'>{String(row.error)}</span> : '—'}
         </Field>

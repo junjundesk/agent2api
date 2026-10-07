@@ -6,7 +6,8 @@
 //!
 //! 聚合规则逐条对照 Node：
 //!   - 按行切 `data:`，`[DONE]` 与空行跳过
-//!   - `delta.content` / `delta.reasoning_content` 字符串拼接
+//!   - `delta.content` / `delta.reasoning_content` / `delta.reasoning` 字符串拼接
+//!     （最后一种是 Cline 免费池的写法，见 `consume_line` 的说明）
 //!   - `delta.tool_calls` 按 `index` 合并（id/type 覆盖、function.name 与
 //!     function.arguments 追加）
 //!   - `usage` 取最后一次出现（上游在末尾 chunk 下发）
@@ -63,10 +64,15 @@ pub async fn aggregate_sse_completion(
 ) -> Result<AggregatedCompletion, GatewayError> {
     // 与 `ForwardStream::new` 同款：reqwest 错误在这里就地描述成文案折进
     // io::Error（`describe_error_detail` 只认 reqwest::Error）
-    let stream = response.bytes_stream().map(|item| {
-        item.map_err(|error| {
+    let capture = telemetry.capture();
+    let stream = response.bytes_stream().map(move |item| {
+        let item = item.map_err(|error| {
             std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
-        })
+        });
+        if let (Ok(bytes), Some(capture)) = (&item, &capture) {
+            capture.push(bytes);
+        }
+        item
     });
     aggregate_frame_stream(Box::pin(stream), telemetry, model_rewrite).await
 }
@@ -78,6 +84,7 @@ pub async fn aggregate_sse_completion(
 /// [`aggregate_sse_completion`] 共用同一套聚合规则，只是输入从
 /// reqwest::Response 换成已翻译的帧流。telemetry / model_rewrite 的语义
 /// 与那个函数完全一致（见它的说明）。
+/// 原始报文由输入流在翻译前采集，本函数不重复采集内部 chat 帧。
 pub async fn aggregate_frame_stream(
     stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
     telemetry: Arc<RequestTelemetry>,
@@ -149,11 +156,7 @@ async fn aggregate_frame_stream_inner(
             first_chunk_seen = true;
             telemetry.note_first_frame();
         }
-        // 调试模式：上游原始字节旁路给采集器（在解析之前 —— 采的是上游原样
-        // 吐出的 SSE 文本，不是我们解析 / 改写后的结果）
-        if let Some(capture) = telemetry.capture() {
-            capture.push(&chunk);
-        }
+        // 原始字节由输入侧（HTTP 字节流或协议翻译流）采集，聚合器只消费 chat 帧。
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         // 逐行消费（只处理到最后一个 '\n' 之前的内容）
         while let Some(index) = buffer.find('\n') {
@@ -270,8 +273,17 @@ impl CompletionAccumulator {
         if let Some(content) = delta.get("content").and_then(Value::as_str) {
             self.content.push_str(content);
         }
-        if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
-            self.reasoning.push_str(reasoning);
+        // 思考增量挂在哪个字段上，上游并不统一：`reasoning_content`（多数
+        // OpenAI 兼容网关）与 `reasoning`（Cline 免费池实测，配 `reasoning_details`）
+        // 两种都见过。只认前者会把「整段输出都是思考」的响应聚合成一条
+        // content 空、reasoning 也空的消息 —— 下游的空回检测据此报
+        // 「empty response detected」。参考实现 cline-proxy 的 `sawContent`
+        // 同样把 `reasoning` 算作内容，理由与这里一样（见其 proxy.go 的注释）。
+        // 两个字段都累加、不互斥：与 cline-proxy 逐字同口径。
+        for key in ["reasoning_content", "reasoning"] {
+            if let Some(reasoning) = delta.get(key).and_then(Value::as_str) {
+                self.reasoning.push_str(reasoning);
+            }
         }
         if let Some(finish) = choice.get("finish_reason").and_then(Value::as_str) {
             if !finish.is_empty() {
@@ -303,6 +315,24 @@ impl CompletionAccumulator {
 
     /// 组装最终 body（对应 Node 的 handleChunk 结束后的返回对象）
     fn into_completion(self) -> AggregatedCompletion {
+        // ── 诊断：上游只回了思考、正文为空 ──────────────────────────
+        // 这是**允许发生**的一种结局（始终思考的模型在小输出额度下会把额度
+        // 全花在思考上，上游仍回 200，见 `providers::zcode::reasoning` 的模块头）。
+        // 网关不在这里改协议 —— 伪造一个错误帧会让「上游到底说了什么」失去
+        // 可信度；这里只把事实写进日志：排查这类问题时最缺的正是
+        // 「上游其实只回了思考」这一条。
+        if self.content.trim().is_empty() && !self.reasoning.trim().is_empty() {
+            crate::server::logging::verbose(
+                "[Model]",
+                &format!(
+                    "⚠️ 上游只回了思考、正文为空（model={} finish={} 思考 {} 字）：\
+                     多为输出额度被思考吃光，可调高 max_tokens 或降低思考档位",
+                    self.model,
+                    if self.finish.is_empty() { "-" } else { &self.finish },
+                    self.reasoning.chars().count(),
+                ),
+            );
+        }
         let mut message = Map::new();
         message.insert(
             "role".to_string(),
@@ -415,5 +445,78 @@ fn js_number_truthy(value: &Value) -> bool {
         Value::Number(number) => number.as_f64().map(|item| item != 0.0).unwrap_or(false),
         Value::String(text) => !text.is_empty(),
         Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 喂一行 SSE（非 JSON / 非 data: 行静默忽略，与生产路径一致）
+    fn feed(acc: &mut CompletionAccumulator, line: &str) {
+        let telemetry = RequestTelemetry::new();
+        acc.consume_line(line, &telemetry)
+            .unwrap_or_else(|error| panic!("consume_line 失败：{error}"));
+    }
+
+    /// 上游把思考放在 `delta.reasoning`（Cline 免费池实测的写法，配
+    /// `reasoning_details`）时，非流式聚合必须把它留下：只认 `reasoning_content`
+    /// 会让「整段输出都是思考」的响应聚合成 content 空、reasoning 也空的消息，
+    /// 下游的空回检测（如 AxonHub）据此报「empty response detected」。
+    /// 参考实现 cline-proxy 的 `sawContent` 同样把 `reasoning` 算作内容。
+    #[test]
+    fn reasoning_delta_is_kept() {
+        let mut acc = CompletionAccumulator::default();
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        );
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"reasoning":"我们先分析"},"finish_reason":null}]}"#,
+        );
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"reasoning":"题目。"},"finish_reason":"length"}]}"#,
+        );
+        feed(&mut acc, "data: [DONE]");
+
+        let body = acc.into_completion().body;
+        let message = &body["choices"][0]["message"];
+        assert_eq!(message["reasoning_content"], "我们先分析题目。");
+        // content 本来就空 —— 聚合结果里必须仍有一条非空的可读字段，
+        // 这正是「有没有内容」的判据
+        assert_eq!(message["content"], "");
+    }
+
+    /// `reasoning_content` 与 `reasoning` 都累加、互不排斥（与 cline-proxy
+    /// 逐字同口径）：上游在不同分片里换字段时不会丢内容。
+    #[test]
+    fn both_reasoning_fields_accumulate() {
+        let mut acc = CompletionAccumulator::default();
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"reasoning_content":"甲"},"finish_reason":null}]}"#,
+        );
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"reasoning":"乙"},"finish_reason":null}]}"#,
+        );
+        let body = acc.into_completion().body;
+        assert_eq!(body["choices"][0]["message"]["reasoning_content"], "甲乙");
+    }
+
+    /// 纯正文分片不受影响（reasoning 字段为空时不写回该键）
+    #[test]
+    fn content_only_stays_as_before() {
+        let mut acc = CompletionAccumulator::default();
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"content":"你好"},"finish_reason":"stop"}]}"#,
+        );
+        let body = acc.into_completion().body;
+        let message = &body["choices"][0]["message"];
+        assert_eq!(message["content"], "你好");
+        assert!(message.get("reasoning_content").is_none());
     }
 }

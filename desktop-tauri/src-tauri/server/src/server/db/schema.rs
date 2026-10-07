@@ -193,7 +193,13 @@ pub fn is_reserved(key: &str) -> bool {
 /// 见 [`V6_SCHEMA`]。同样是既有表加列（ALTER 两连）。这两列只在**在途**
 /// 期间有值，收尾时一律清空（见 `request_stats::sql` 的各条收尾语句）——
 /// 「有没有阶段」因此就是「这一行还在跑」的第二个读数，与 status=0 同进同退。
-pub const SCHEMA_VERSION: i64 = 6;
+///
+/// ── 版本 7：requests 表加「测试来源」一列 ─────────────────────
+/// 见 [`V7_SCHEMA`]。同样是既有表加列（单条 ALTER）。模型测试走的是真实转发
+/// 链路，它产生的请求会照常进请求日志 —— 这一列把它与真实流量分开，
+/// 于是报表聚合能把它排除（测试是人工反复发起的样本，混进去会把真实流量读歪），
+/// 而请求日志那边照旧能看到它、并标成「测试」。
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -526,6 +532,26 @@ ALTER TABLE requests ADD COLUMN phase TEXT NOT NULL DEFAULT '';
 ALTER TABLE requests ADD COLUMN phase_started_at INTEGER;
 ";
 
+/// 版本 7：`requests` 补一列（schema v7）—— 这条请求是不是**模型测试**发起的。
+///
+/// ── 存什么 ──────────────────────────────────────────────────
+/// `is_test = 1`：这条明细来自模型管理页的「测试」（`api::model_test`）；
+/// `0`（默认，含全部旧行）：真实流量。
+///
+/// ── 为什么要有它（而不是靠「模型名 / 来源」猜）────────────────
+/// 测试请求与真实请求**走的是同一条转发链路**（这正是测试的价值：结论与生产
+/// 同源），所以它们在明细里长得一模一样 —— 模型、账号、状态码、用量全都真实。
+/// 唯一能分开它们的就是「这次是谁发起的」，而那只有入口知道。报表按天聚合
+/// （`request_stats` 的 `fold_into_daily` 与 `rebuild_day`）据此跳过测试行，
+/// 请求日志则照常显示并标出来。
+///
+/// 加列走 ALTER 的全部理由（为什么不动 v1 的 DDL、为什么不能写
+/// IF NOT EXISTS、幂等靠版本号）与 [`V2_SCHEMA`] 完全相同，不赘述。
+const V7_SCHEMA: &str = "
+-- ── requests 补一列（schema v7）──────────────────────────────
+ALTER TABLE requests ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0;
+";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// 返回 `rusqlite::Result` 而不是本模块自造的字符串错误：调用方 `Db::open`
@@ -585,6 +611,8 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         5 => conn.execute_batch(V5_SCHEMA),
         // v6：requests 补阶段与阶段计时两列（在途请求的状态列读数，见 V6_SCHEMA）
         6 => conn.execute_batch(V6_SCHEMA),
+        // v7：requests 补「测试来源」一列（模型测试的流量标记，见 V7_SCHEMA）
+        7 => conn.execute_batch(V7_SCHEMA),
         _ => Ok(()),
     }
 }

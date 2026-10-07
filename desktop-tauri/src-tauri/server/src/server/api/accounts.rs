@@ -239,7 +239,7 @@ pub async fn dispatch(
         }
         // 定时查询那一轮的结果快照（形状同 usage，多一个 `at`）
         ("GET", "usage/snapshot") => {
-            return super::accounts_usage::accounts_usage_snapshot().await
+            return super::accounts_usage::accounts_usage_snapshot(&state).await
         }
         // 账号级活跃连接数（账号页「连接数」列；见 `core::upstream::connections`）
         ("GET", "connections") => return account_connections(&state),
@@ -331,8 +331,9 @@ pub async fn dispatch(
 ///   ③ `AutoClaw` → AutoClaw 路径（W4b-T-c2）：`importDesktop === true` 导入
 ///      桌面端实时登录态（`%APPDATA%/AutoClaw/auth.json`，DPAPI 解密）；
 ///      否则手动添加（token/refreshToken + deviceId，`enc:` 密文自动解密）；
-///   ④ `WorkBuddy` 或**字段缺失** → 既有 workbuddy 路径（`store.add_account`
-///      不读 payload 里的 provider，见该函数的说明）。
+///   ④ `WorkBuddy` / `WorkBuddyIntl` 或**字段缺失** → 既有 workbuddy 路径
+///      （`store.add_account`，归属由这里的 provider id 给出：国际版与国内版
+///      共用同一套凭证形态与落账号路径，差别只在落进哪一家）。
 ///
 /// ── AutoClaw 曾经在这里显式 400（历史，别改回去）─────────────────
 /// W4a–W4b 之间它的凭证链路还没落地，那时这里对它的 payload 报 400：若让它落进
@@ -569,8 +570,32 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             }
             store.add_trae_account(&credential, import_name, "manual")
         }
-        Some(crate::server::core::providers::ProviderKind::WorkBuddy) | None => {
-            store.add_account(&payload, None)
+        // Loomy（讯飞）：**粘贴 session** → 手动添加（短信登录是另一条链路，
+        // `POST /api/session/login/loomy/sms/verify` → 同一个落账号入口
+        // `add_loomy_account`）。
+        //
+        // `importDesktop` 不提供：Loomy 的登录态在客户端自己的加密存储里，
+        // 没有 auth.json 那种稳定可读的文件形态 —— 给了入口只会稳定失败
+        // （与 Accio / ZCode 同一处境）。
+        Some(crate::server::core::providers::ProviderKind::Loomy) => {
+            if import_desktop {
+                return management_error(
+                    400,
+                    "Loomy 不支持导入桌面端登录态，请用「手机号验证码登录」或粘贴 session 添加账号",
+                );
+            }
+            store.add_loomy_account(&payload, import_name)
+        }
+        // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
+        // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的
+        // `edition` 反推：那是账号的属性，而落哪一家是身份问题）。
+        // `None`（老客户端不带 provider 字段）按国内版，历史契约不变。
+        Some(crate::server::core::providers::ProviderKind::WorkBuddy)
+        | Some(crate::server::core::providers::ProviderKind::WorkBuddyIntl)
+        | None => {
+            let provider = crate::server::core::providers::kind_from_id(provider)
+                .map(crate::server::core::providers::kind_id);
+            store.add_account(&payload, None, provider)
         }
     };
     match result {
@@ -720,11 +745,19 @@ pub async fn batch_accounts(state: &ServerState, body: &Bytes) -> Response {
 
 /// 刷新账号 token（**按账号所属 provider 分派**）。
 ///
-/// workbuddy 账号走既有的 `AuthService::refresh_account`；小浣熊与 AutoClaw 账号
-/// 各走自家适配器的 `refresh_access_token`；**CatPaw 账号没有可刷新的东西**
+/// workbuddy 账号走既有的 `AuthService::refresh_account`；小浣熊、AutoClaw、
+/// CodeArts、**Trae / ZCode**、Accio、Cline 账号各走自家适配器的
+/// `refresh_access_token`；**CatPaw 账号没有可刷新的东西**
 /// （§9.1：`X-Passport-Token` 过期只能在桌面端重新登录，没有 refreshToken），
 /// 因此这里明确报 400 并说明做法 —— 静默走 workbuddy 的刷新会拿 CatPaw 的凭证
 /// 去打腾讯的鉴权接口。
+///
+/// 漏登记的实际代价（两条都是生产抓到的）：CodeArts 漏的时候用户点「刷新 Token」
+/// 得到 `client key [] not found`；Trae 漏的时候得到
+/// `12153:refresh token failed:10000:token format error`（2026-10-02 15:47:57 实测）——
+/// 两条都长得像"这把凭据坏了"，其实是发错了家的端点。所以**加一家带 refreshToken
+/// 的提供商时，这张分派表必须一起加** —— 它在 `PROVIDERS` 与各 adapter 注册点之外，
+/// 编译器不会提醒，漏了只在用户点按钮时才暴露。
 ///
 /// 为什么不统一到一个抽象：四家的刷新协议毫无共同点，而「刷新」是**管理动作**、
 /// 不是转发链路上的 provider 契约（那条契约的 `refresh_access_token` 是转发时的
@@ -766,6 +799,19 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     // `auth/token/refresh 失败: client key [] not found`）。
     if state.store().codearts_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::CodeArts).await;
+    }
+    // Trae：一次性 refreshToken + 每次换发都轮换，必须走它自己的适配器
+    // （`ExchangeToken`）。**这条也不能省**：漏了就落到下面的 workbuddy 兜底，
+    // 用户点「刷新 Token」收到的是腾讯那侧的错 —— 生产实测（2026-10-02 15:47:57）
+    // 原文是 `auth/token/refresh 失败: 12153:refresh token failed:10000:token format
+    // error`，"token format error" 其实就是**把 Trae 的续期串发给了 workbuddy 的
+    // 鉴权端点**，与账号本身好不好没有任何关系。
+    if state.store().trae_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::Trae).await;
+    }
+    // ZCode：同一条理由（它的续期是自家 OAuth 那套，不是 workbuddy 的链）
+    if state.store().zcode_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::Zcode).await;
     }
     // Accio（两个地区）：走适配器的强制刷新（`POST /api/auth/refresh_token`，
     // 结果按「比较再写」回写）。两个地区各查一次 —— 账号集合按 provider 隔离，
@@ -836,6 +882,10 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
              然后在本页重新导入桌面端登录态（或重新粘贴新的登录凭证）",
         );
     }
+    // WorkBuddy 系（国内版 / 国际版）的兜底：两条链路都按**账号自己的**
+    // endpoint / prefixPath / platform / edition 续期
+    // （`AuthService::refresh_account_inner` 从记录里读，见那里的说明），
+    // 因此拆家后不必按地区分派 —— 国际版账号自然打国际站的 refresh 端点。
     match state.auth().refresh_account(&id).await {
         Ok(_) => ok_json(json!({
             "refreshedId": id,
@@ -1018,6 +1068,46 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
             };
         }
         match state.store().update_zcode_plan(&id, value) {
+            Ok(changes) => balance_changes.extend(changes),
+            Err(error) => return store_error(error),
+        }
+    }
+    // 自定义账号的凭证（`apiKey` / `noAuth`）：与上面两段同一处境 —— 只有自定义
+    // 家认这两个键，所以不进通用 `apply_patch`。**账号 id 由 HTTP 路径给定，
+    // 改凭证不改 id**（id 是身份：限额冷却、请求日志、导出文件都按它关联），
+    // 于是这里不需要「同 key 合并」那条添加侧的逻辑。
+    if patch.get("apiKey").is_some() || patch.get("noAuth").is_some() {
+        // `custom_account_provider` 一次回答两件事：账号在不在、属不属于自定义家
+        // （判据是记录里的 `provider` 前缀，不要求提供商本身还在配置里，
+        // 见那个函数的说明）—— 与 balanceToken / zcodePlan 的两次查询同口径
+        if state.store().custom_account_provider(&id).is_none() {
+            let known = state
+                .store()
+                .list_accounts()
+                .get("accounts")
+                .and_then(Value::as_array)
+                .map(|accounts| {
+                    accounts
+                        .iter()
+                        .any(|item| item.get("id").and_then(Value::as_str) == Some(id))
+                })
+                .unwrap_or(false);
+            return if known {
+                management_error(400, "只有自定义提供商的账号有 API Key / 无需鉴权这两项")
+            } else {
+                store_error(AccountStoreError::new("账号不存在", 404))
+            };
+        }
+        // 只把请求里**真的带了**的键递下去（`apiKey: null` 是有意义的取值：
+        // 清除凭证），其余字段由下面的通用 `update_account` 处理 —— 两者各守
+        // 各的字段集，互不干扰
+        let mut scoped = Map::new();
+        for key in ["apiKey", "noAuth"] {
+            if let Some(value) = patch.get(key) {
+                scoped.insert(key.to_string(), value.clone());
+            }
+        }
+        match state.store().update_custom_credentials(&id, &Value::Object(scoped)) {
             Ok(changes) => balance_changes.extend(changes),
             Err(error) => return store_error(error),
         }

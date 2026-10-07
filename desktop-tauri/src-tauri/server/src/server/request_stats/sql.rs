@@ -70,7 +70,7 @@ use super::report::normalize_status_filter;
 const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
-     client_reasoning, upstream_reasoning, phase, phase_started_at";
+     client_reasoning, upstream_reasoning, phase, phase_started_at, is_test";
 
 // `request_daily`（按天聚合）那一支的列常量、编解码与读-改-写语句在
 // `daily.rs` —— 两张表的语句分文件后各自独立演化。
@@ -118,6 +118,10 @@ fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEntry> {
         // 读出来是 '' 与 NULL —— 与「不在途」在写入侧收敛成同一组值
         phase: row.get(21)?,
         phase_started_at: row.get(22)?,
+        // 末列是 schema v7 加的（测试来源）；旧行 DEFAULT 0 → false（真实流量）。
+        // SQLite 没有布尔类型，按 INTEGER 读再判非零 —— 不依赖驱动对 bool 的
+        // 隐式转换（手改过的库里写成 2 也照样算「是测试」）
+        is_test: row.get::<_, i64>(23)? != 0,
     })
 }
 
@@ -394,13 +398,22 @@ pub(super) fn select_page_desc(
 ///   - `rebuild_day` 重算某天聚合时取那一天的剩余明细。
 /// 顺序取升序（而不是报表本身需要的顺序）是为了让重算与 `record` 的累加次序
 /// 一致 —— 三个维度数组里条目的先后只影响视觉，但没必要制造差异。
+///
+/// `exclude_tests` **只给报表侧传 true**（模型测试的流量不进报表，见
+/// `RequestEntry::is_test`）：这几个调用点读的都是「算报表用的一份明细」，
+/// 而测试是人工反复发起的样本，混进趋势图会把真实流量读歪。请求日志那一侧
+/// 走的是 `select_page_desc`，不受这个开关影响 —— 日志要照常显示测试行。
 pub(super) fn select_between(
     conn: &Connection,
     from_ms: i64,
     to_ms: i64,
+    exclude_tests: bool,
 ) -> rusqlite::Result<Vec<RequestEntry>> {
+    // 条件拼在这里而不是拆成两条 SQL：两条 SQL 迟早会漂（一处改了排序、
+    // 另一处忘了），而它们的差异只有一个布尔条件
+    let filter = if exclude_tests { " AND is_test = 0" } else { "" };
     let sql = format!(
-        "SELECT {REQUEST_COLUMNS} FROM requests WHERE ts >= ?1 AND ts <= ?2 \
+        "SELECT {REQUEST_COLUMNS} FROM requests WHERE ts >= ?1 AND ts <= ?2{filter} \
          ORDER BY ts ASC, row_id ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -439,6 +452,7 @@ pub(super) fn insert_started_request(
     model: &str,
     client_model: &str,
     client_reasoning: &str,
+    is_test: bool,
 ) -> rusqlite::Result<bool> {
     let existing: i64 = conn.query_row(
         "SELECT COUNT(*) FROM requests WHERE id = ?1 AND status = 0",
@@ -450,11 +464,13 @@ pub(super) fn insert_started_request(
     }
     // client_reasoning 随首发写入：下游等级在请求开始时就定稿了（与 client_model
     // 同一时刻、同一来源），进行中行就能显示「请求的什么(等级)」
+    // is_test 同样随首发写入：来源是入口就知道的事实，等收尾再补会让「进行中」
+    // 那一段的测试行看起来与真实流量一样
     conn.execute(
         "INSERT INTO requests (id, ts, model, client_model, client_reasoning, status, \
-         phase, phase_started_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'connecting', ?2)",
-        params![id, ts, model, client_model, client_reasoning],
+         phase, phase_started_at, is_test) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'connecting', ?2, ?6)",
+        params![id, ts, model, client_model, client_reasoning, is_test as i64],
     )?;
     Ok(true)
 }
@@ -584,7 +600,8 @@ pub(super) fn update_running_request(
          duration_ms = ?7, first_response_ms = ?8, attempts = ?9, error = ?10, prompt_tokens = ?11, \
          completion_tokens = ?12, total_tokens = ?13, cache_read_tokens = ?14, provider = ?15, \
          client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19, \
-         client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL \
+         client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL, \
+         is_test = ?22 \
          WHERE id = ?1 AND status = 0",
         params![
             entry.id,
@@ -608,6 +625,9 @@ pub(super) fn update_running_request(
             encode_json_list(&entry.sensitive_hits),
             entry.client_reasoning,
             entry.upstream_reasoning,
+            // 来源标记收尾时**再写一次**（而不是只在首发时写）：这条 UPDATE 是
+            // 无进行中行时的兜底之外的主路径，写一次保证两条插入路径口径一致
+            entry.is_test as i64,
         ],
     )
 }
@@ -625,9 +645,9 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
         "INSERT INTO requests (id, ts, model, account_id, account_name, status, duration_ms, \
          first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
          cache_read_tokens, provider, client_model, upstream_model, attempt_details, \
-         sensitive_hits, client_reasoning, upstream_reasoning) \
+         sensitive_hits, client_reasoning, upstream_reasoning, is_test) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21)",
+         ?18, ?19, ?20, ?21, ?22)",
         params![
             entry.id,
             entry.ts,
@@ -650,6 +670,7 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
             encode_json_list(&entry.sensitive_hits),
             entry.client_reasoning,
             entry.upstream_reasoning,
+            entry.is_test as i64,
         ],
     )?;
     Ok(())

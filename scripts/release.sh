@@ -6,7 +6,7 @@
 #
 # 做三件事：
 #   1. 下载 build 工作流的两个安装包 artifact（windows-nsis / macos-universal）到 dist/；
-#   2. 用 tag 所指提交的提交信息（= 更新日志，见 AGENT.md 第 2 节）创建 / 更新
+#   2. 用 tag 所指提交的提交信息（= 更新日志，见 agent.md 第 5 节）创建 / 更新
 #      GitHub Release 并挂两个附件；
 #   3. 打印验收提示。
 #

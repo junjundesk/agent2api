@@ -4,24 +4,25 @@
 
 Wraps the login state of several AI desktop clients into a local **OpenAI-compatible API gateway**, exposing a single `base_url` and bundling multi-provider account management, model management (enable / disable / delete / alias), content redaction, egress proxying and request reporting — plus a ready-to-run Tauri desktop app. Any OpenAI client that accepts a custom `base_url` can call these providers' model quota through `http://127.0.0.1:3065/v1` — no API key, no client source changes needed.
 
-```
-OpenAI client / any SDK
-        │  POST /v1/chat/completions   (OpenAI-compatible, SSE)
-        ▼
-  Agent2API gateway (in-process Rust service)   ← local 127.0.0.1:3065
-  model mapping · account candidate chain (global priority) · 429 fallback · egress proxy · content redaction
-        │  HTTPS (the model name decides which provider is called)
-        ├──▶ workbuddy  copilot.tencent.com (China) / www.workbuddy.ai (Global)
-        ├──▶ raccoon    xiaohuanxiong.com/api/web/llm/v2 · Authorization: Bearer <JWT>
-        ├──▶ catpaw     ai.catpaw.meituan.com · Cookie: X-Passport-Token=… + user-uid
-        │                (its own conversation session protocol)
-        ├──▶ autoclaw   autoglm-acceleration-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw
-        │                (domestic) X-Authorization: Bearer <token> (OpenAI-compatible)
-        ├──▶ autoclaw-intl  autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw
-        │                (international) same protocol and signing fingerprint, different site
-        └──▶ qoder      api3.qoder.sh (Global) / gateway.qoder.com.cn (China)
-                         COSY self-signed headers (not Bearer) · envelope-style SSE (custom encoding and signing)
-```
+Reverse-proxy capabilities at a glance (✓ supported · ✗ not supported · — no such concept / not applicable):
+
+| Platform | LLM requests | Token auto-refresh | Model list (remote refresh) | Balance query | Daily check-in | Claims |
+| --- | :--: | :--: | :--: | :--: | :--: | :--: |
+| WorkBuddy (China) | ✓ | ✓ | ✓ remote + static fallback | ✓ | ✓ daily check-in | — |
+| WorkBuddy (Global) | ✓ | ✓ | ✓ remote + static fallback | ✓ | ✗ no check-in program | — |
+| Raccoon | ✓ | ✓ | ✓ remote + static fallback | ✓ | ✓ daily desktop-login points | — |
+| CatPaw | ✓ | ✗ no refresh flow | ✓ remote + static fallback | ✓ | ✗ | — |
+| AutoClaw (domestic / international) | ✓ | ✓ | ✓ remote + static fallback | ✓ | ✓ daily check-in | — |
+| Qoder | ✓ | ✓ | ✓ remote (per region) + static fallback | ✓ | ✓ China only | — |
+| Cline (Free / Pass) | ✓ | ✓ | ✓ remote + static fallback | ✓ | — | — |
+| Accio (international / domestic) | ✓ | ✓ | ✓ remote + static fallback | ✓ used-percent only | — | — |
+| ZCode (domestic / international) | ✓ | ✗ | ✗ static table | ✓ plan balance | — | ✓ timed plan (manual) |
+| CodeArts | ✓ | ✓ one-shot rotation | ✓ remote (three sources merged) | ✓ two ledgers | — | ✓ daily welfare (manual) |
+| Trae | ✓ | ✓ single-use rotation | ✓ remote only | ✓ two ledgers | — | — |
+| Loomy (iFlytek) | ✓ | ✗ no refresh flow | ✓ remote only | ✓ two point ledgers | ✓ daily gifted-points refresh | — |
+| Custom providers | ✓ chat passthrough / Responses / Anthropic | — | ✓ manual + server-side fetch | — | — | — |
+
+The three chat entry points (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, plus `/v1/messages/count_tokens`) and `/v1/models` behave identically for every platform — the differences above are only about what each upstream can do. Model mapping, the global priority queue, 429 fallback, egress proxying, content redaction and request reporting apply to all platforms alike.
 
 > [!IMPORTANT]
 > **This is a fork of [aimod-cc/agent2api](https://github.com/aimod-cc/agent2api) with a single difference from upstream:**
@@ -29,7 +30,7 @@ OpenAI client / any SDK
 
 > **This project is for learning and discussion only.** It reuses the login state of your own accounts through a local reverse proxy; forwarding requests in the shape of a non-official client may violate the upstream services' terms of service, and any risk (including rate limiting or account bans) is borne by the user. Commercial use and circumventing billing are prohibited. See [Usage Notice](#usage-notice) and [LICENSE](./LICENSE).
 >
-> This is a personal, local-purpose proxy tool. It is unaffiliated with Tencent (WorkBuddy), Meituan (CatPaw), SenseTime (Raccoon), Zhipu (AutoClaw/autoglm), Alibaba Cloud (Qoder / Accio), Huawei Cloud (CodeArts), ByteDance (Trae), Cline and their official products; every interface shape comes from observing each vendor's desktop client traffic, and upstream may change at any time.
+> This is a personal, local-purpose proxy tool. It is unaffiliated with Tencent (WorkBuddy), Meituan (CatPaw), SenseTime (Raccoon), Zhipu (AutoClaw/autoglm), Alibaba Cloud (Qoder / Accio), Huawei Cloud (CodeArts), ByteDance (Trae), iFlytek (Loomy), Cline and their official products; every interface shape comes from observing each vendor's desktop client traffic, and upstream may change at any time.
 
 ---
 
@@ -50,7 +51,7 @@ OpenAI client / any SDK
 Download the installer from Releases (NSIS, Simplified Chinese, installs to `C:\Program Files\Agent2API` by default, and needs administrator approval during setup), then launch it — **no Node or any other runtime required**.
 
 1. First launch starts the local gateway (port 3065) inside the app process and opens the main window. If an older version's data directory or data files are found, a dialog walks you through the migration.
-2. Click "Add account" on the Accounts page, pick a provider (WorkBuddy / Raccoon / CatPaw / AutoClaw domestic / AutoClaw international / Qoder / Cline / Accio international / Accio domestic / CodeArts / Trae), then sign in or fill in credentials using whatever that vendor supports: web login, SMS code, pasting credentials, or importing this machine's desktop login state (importing stores no token — the gateway follows once the desktop client signs in again; CodeArts and Trae only offer web login and pasted credentials).
+2. Click "Add account" on the Accounts page, pick a provider (WorkBuddy / Raccoon / CatPaw / AutoClaw domestic / AutoClaw international / Qoder / Cline / Accio international / Accio domestic / ZCode domestic / ZCode international / CodeArts / Trae / Loomy), then sign in or fill in credentials using whatever that vendor supports: web login, SMS code, pasting credentials, or importing this machine's desktop login state (importing stores no token — the gateway follows once the desktop client signs in again; CodeArts and Trae only offer web login and pasted credentials; Loomy only offers SMS sign-in and pasted session).
 3. Set your OpenAI client's `base_url` to `http://127.0.0.1:3065/v1` and put anything in `api_key` (for example `sk-local`; the server does not check it while authentication is disabled).
 
 Closing the window only minimizes to the tray by default, and the gateway keeps forwarding in the background; to quit for real, right-click the tray icon and choose "Exit".
@@ -82,6 +83,8 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)
 ```
+
+**Pages running in a browser** (a self-built web UI, a single-file frontend app, …) that call this endpoint with `fetch` will fail with "cannot connect to the API": the gateway surface does **not** answer CORS by default, so the preflight (OPTIONS) lands on the API-key check and gets a 401 (a cross-origin preflight never carries the `Authorization` header) and the real request is never sent. Two ways out: ① turn on "Security → Gateway CORS" in Settings — the gateway then answers exactly like the panel does (preflight allowed, responses carry `Access-Control-Allow-*` with origin `*`, effective immediately). Note the gateway is the surface that really forwards upstream and spends quota: with `*` and no API key configured, any web page could drive your local gateway, so configure a "Gateway Key" as well; ② make the page same-origin — run a small local static server that also reverse-proxies `/v1` to `127.0.0.1:3065`, which removes cross-origin entirely and needs no relaxation at all.
 
 ---
 
@@ -121,7 +124,7 @@ Environment variables (all optional — nothing needs to be preset):
 
 Build from source: clone the repo and run `docker compose up -d --build` (the image contains only the gateway and the panel, no Rust toolchain).
 
-**Web panel capability notes** (all differences stem from having no local desktop client): web login (WorkBuddy / Qoder / Cline), SMS codes and pasted credentials work fully; AutoClaw / CatPaw / Accio / CodeArts / Trae web-login callbacks hit the machine's own port, so from a remote panel use pasted credentials instead; Raccoon web login and "import desktop login state" are unavailable (use pasted credentials; CodeArts and Trae have no desktop login state to import either).
+**Web panel capability notes** (all differences stem from having no local desktop client): web login (WorkBuddy / Qoder / Cline), SMS codes and pasted credentials work fully; AutoClaw / CatPaw / Accio / CodeArts / Trae web-login callbacks hit the machine's own port, so from a remote panel use pasted credentials instead; Raccoon web login and "import desktop login state" are unavailable (use pasted credentials; Loomy, CodeArts and Trae have no desktop login state to import either).
 
 ---
 
@@ -212,7 +215,7 @@ agent2api/
 │  │  │  │  │  │                models (agent / builtin / benefit-gateway merge) /
 │  │  │  │  │  │                balance (subscription statistics + benefit pool, two accounts) /
 │  │  │  │  │  │                welfare (daily claim: idempotency key persisted first, verified after)
-│  │  │  │  │  └─ trae/         Trae (ByteDance AI IDE, SOLO channel): credentials / device (device keypair) /
+│  │  │  │  │  ├─ trae/         Trae (ByteDance AI IDE, SOLO channel): credentials / device (device keypair) /
 │  │  │  │  │                   login + oauth (PKCE web login + token-exchange candidates) / callback_server
 │  │  │  │  │                   (random local port callback with noise filtering) / refresh (single-flight) /
 │  │  │  │  │                   payload (SOLO envelope rebuilt from a whitelist) / headers (SOLO header set) /
@@ -220,6 +223,11 @@ agent2api/
 │  │  │  │  │                   errors (error classification and dead-config list) /
 │  │  │  │  │                   models (get_detail_param catalog) /
 │  │  │  │  │                   usage (entitlement packs + plan quota, two accounts) / profile (identity parsing)
+│  │  │  │  │  └─ loomy/        Loomy (iFlytek): login (SMS code) / credentials (14-day session, no
+│  │  │  │  │                   refresh flow) / sign (client HMAC-SHA1 headers) / endpoints /
+│  │  │  │  │                   client (integration gateway) / models (/api/v1/models remote only,
+│  │  │  │  │                   no built-in fallback) / balance (permanent + daily gifted points) /
+│  │  │  │  │                   checkin (first login of the day refreshes the gifted points)
 │  │  │  │  ├─ upstream/        Forwarding orchestration: global account queue loop (provider_loop) + request body
 │  │  │  │  │                   handling (payload) + SSE passthrough/aggregation + usage side-channel extraction
 │  │  │  │  ├─ account_store/   Account storage (global priority, rate-limit cooldown, per-vendor add and import)
@@ -287,7 +295,7 @@ The root project has no runtime dependencies; `package.json` only provides the s
 
 ### For learning and discussion only
 
-This project is a hands-on exercise in HTTP reverse proxying, SSE streaming passthrough, multi-upstream protocol adaptation and desktop packaging (Tauri), and is **for personal learning and research only**. It is not an official product and has no affiliation with, endorsement from or sponsorship by Tencent and WorkBuddy / CodeBuddy, Meituan and CatPaw, SenseTime and Raccoon, Zhipu and AutoClaw / autoglm, Alibaba and Qoder / Accio, Huawei Cloud and CodeArts, or ByteDance and Trae.
+This project is a hands-on exercise in HTTP reverse proxying, SSE streaming passthrough, multi-upstream protocol adaptation and desktop packaging (Tauri), and is **for personal learning and research only**. It is not an official product and has no affiliation with, endorsement from or sponsorship by Tencent and WorkBuddy / CodeBuddy, Meituan and CatPaw, SenseTime and Raccoon, Zhipu and AutoClaw / autoglm, Alibaba and Qoder / Accio, Huawei Cloud and CodeArts, ByteDance and Trae, or iFlytek and Loomy.
 
 ### About the reverse-proxy behaviour
 

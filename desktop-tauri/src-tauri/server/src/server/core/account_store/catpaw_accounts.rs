@@ -37,7 +37,7 @@ use serde_json::{Map, Value};
 
 use crate::server::core::account_store::priority::next_free_priority;
 use crate::server::core::account_store::sql;
-use crate::server::core::account_store::state::StoredAccount;
+use crate::server::core::account_store::state::{mark_name_custom, StoredAccount};
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{
     js_string, max_concurrent_public, object_or_empty, strip_bearer_prefix, token_tail_of,
@@ -207,6 +207,7 @@ impl AccountStore {
             .filter(|value| !value.is_empty())
             .map(|value| truncate_chars(value, MAX_NAME_LENGTH));
         // 备注名兜底照抄原项目：显式传入 → 记录里的 name → loginName → uid
+        let explicit = explicit_name.is_some();
         let record_name = explicit_name
             .or_else(|| {
                 existing
@@ -237,6 +238,7 @@ impl AccountStore {
         record.insert("id".to_string(), Value::String(id.clone()));
         record.insert("provider".to_string(), Value::String(catpaw_id().to_string()));
         record.insert("name".to_string(), Value::String(record_name.clone()));
+        mark_name_custom(&mut record, explicit, existing.as_ref());
         record.insert("uid".to_string(), Value::String(uid));
         record.insert("loginName".to_string(), Value::String(login_name));
         record.insert("accessToken".to_string(), Value::String(token.clone()));

@@ -25,8 +25,9 @@
 use serde_json::{json, Map, Value};
 
 use super::{
-    content_parts, content_text, event_frame, freeform, is_truthy, json_text, random_id,
-    string_field, string_value, tool_plan, SseLineBuffer, FIELD_ENCRYPTED_CONTENT,
+    content_parts, content_text, event_frame, freeform, is_truthy, json_text, native_tool,
+    random_id, string_field, string_value, tool_plan, SseLineBuffer, TOOL_IMAGE_PLACEHOLDER,
+    FIELD_ENCRYPTED_CONTENT,
 };
 use crate::server::logging;
 
@@ -83,7 +84,7 @@ pub fn chat_from_responses(body: &Value) -> Result<Value, ConvertError> {
     if !plan.declarations.is_empty() {
         let mut converted: Vec<Value> = Vec::new();
         let mut downgraded: Vec<String> = Vec::new();
-        let mut ignored: Vec<String> = Vec::new();
+        let mut natives: Vec<Value> = Vec::new();
         for tool in &plan.declarations {
             if let Some(function) = tool_to_chat(tool) {
                 converted.push(function);
@@ -91,8 +92,10 @@ pub fn chat_from_responses(body: &Value) -> Result<Value, ConvertError> {
             }
             // 没转出来的分两类。custom（freeform）是**要**降级的 —— 漏了就是
             // 静默失效（Codex 的 exec / apply_patch 全部失效即由此而来）；
-            // 其余（web_search / local_shell 等 Responses 原生工具）上游确实
-            // 没有对应物，只能丢，但要留痕，否则同样是静默失效
+            // 其余（web_search / tool_search / file_search 等 Responses 宿主工具）
+            // 是**上游服务端执行**的原生能力：保真携带（原样 + 来源标记），
+            // 去留交给出站侧按目标协议定（见 `native_tool` 模块头）。
+            // 曾经在这里直接丢弃 —— issue #61 / #55 的「原生搜索不可用」即由此来。
             if freeform::is_custom_tool(tool) {
                 if let Some(function) = freeform::downgrade_custom_tool(tool) {
                     downgraded.push(string_field(tool, "name"));
@@ -100,16 +103,22 @@ pub fn chat_from_responses(body: &Value) -> Result<Value, ConvertError> {
                     continue;
                 }
             }
-            ignored.push(tool_plan::tool_kind_label(tool));
+            natives.push(native_tool::carry(tool, native_tool::ORIGIN_RESPONSES));
         }
-        if !ignored.is_empty() {
-            logging::log(
+        if !natives.is_empty() {
+            logging::verbose(
                 "[Responses]",
                 &format!(
-                    "⚠️ 上游 Chat 接口无对应形态，已丢弃这些工具声明：{}",
-                    ignored.join(", ")
+                    "原生（服务端执行）工具声明 {} 条随行：{}",
+                    natives.len(),
+                    natives
+                        .iter()
+                        .map(tool_plan::tool_kind_label)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             );
+            converted.extend(natives);
         }
         if !downgraded.is_empty() {
             logging::verbose(
@@ -176,21 +185,30 @@ fn messages_from_input(
         // 单个对象（非数组）也接受：客户端偶尔直接给一个 message 项
         if input.is_object() {
             let mut pending = PendingReasoning::default();
-            push_input_item(&mut messages, input, &mut pending)?;
+            let mut images = PendingImages::default();
+            push_input_item(&mut messages, input, &mut pending, &mut images)?;
+            images.flush(&mut messages);
             merge_successive_assistants(&mut messages);
         }
         return Ok(messages);
     };
     // 跨项状态：reasoning 项的正文要挂到**它旁边那条** assistant 消息上，
-    // 而两者在 `input[]` 里是平级的两个项（见 `PendingReasoning` 的说明）
+    // 而两者在 `input[]` 里是平级的两个项（见 `PendingReasoning` 的说明）；
+    // 工具结果带回来的图片同样要跨项攒（见 `PendingImages`）
     let mut pending = PendingReasoning::default();
+    let mut images = PendingImages::default();
     for item in items {
         if let Some(text) = item.as_str() {
+            // 裸字符串是客户端在说话：本轮的图片要先落地，才不会与工具结果脱节
+            images.flush(&mut messages);
             messages.push(json!({ "role": "user", "content": text }));
             continue;
         }
-        push_input_item(&mut messages, item, &mut pending)?;
+        push_input_item(&mut messages, item, &mut pending, &mut images)?;
     }
+    // 收尾：最后一批工具结果后面没有「下一项」来触发下线，这里补一次
+    // （客户端把请求停在工具结果上、等模型继续，正是最常见的形状）
+    images.flush(&mut messages);
     merge_successive_assistants(&mut messages);
     Ok(messages)
 }
@@ -414,16 +432,68 @@ impl PendingReasoning {
     }
 }
 
+/// 等待落地的工具图片（跨 input 项的暂存）。
+///
+/// ── 为什么图片不能留在 tool 消息里 ───────────────────────────
+/// Chat 规范里 `tool` 消息的 content 只允许**文本** part，OpenAI 的校验原文：
+/// `Invalid 'messages'. Image URLs are only allowed for messages with role
+/// 'user', but this message with role 'tool' contains an image URL.`
+/// 直接 400。所以工具带回来的图只能落到一条 user 消息上（这也正是 OpenAI
+/// 社区给出的绕法），留在 tool 消息里等于把「静默丢语义」换成了「整条请求失败」。
+///
+/// ── 为什么要攒到本轮工具结果之后 ─────────────────────────────
+/// 一轮里的多个工具结果是**连续**的 tool 消息，而 Chat 要求 assistant 的
+/// `tool_calls` 被对应的 tool 消息接续应答：中间插任何消息，后面的
+/// tool_call_id 就失去应答（严格上游判 11148 "tool calls and tool results
+/// do not match"，见 `anthropic.rs` 里同一处硬约束的说明）。并行工具调用
+/// （assistant 一条带多个 tool_calls，随后连续多个 tool 消息）必然踩中，
+/// 所以攒到这一轮的工具结果全部落地之后再插一条。
+///
+/// ── 为什么不碰 [`PendingReasoning`] ──────────────────────────
+/// 这条 user 消息是我们造的，不是客户端给的轮次边界。若顺手调
+/// `end_turn()`，会把**已经暂存好、正要挂给下一条 assistant 的 reasoning**
+/// 清掉（形状：`reasoning → function_call`，而 flush 恰恰发生在 function_call
+/// 之前），上游照旧判 `reasoning_content_missing`。
+#[derive(Default)]
+struct PendingImages {
+    /// 已归一成 Chat `image_url` 块的图片
+    parts: Vec<Value>,
+}
+
+impl PendingImages {
+    fn push(&mut self, part: Value) {
+        self.parts.push(part);
+    }
+
+    /// 把攒下的图片落成一条 user 消息（没有图片时什么都不做）
+    fn flush(&mut self, messages: &mut Vec<Value>) {
+        if self.parts.is_empty() {
+            return;
+        }
+        messages.push(json!({
+            "role": "user",
+            "content": Value::Array(std::mem::take(&mut self.parts)),
+        }));
+    }
+}
+
 /// 单个 input 项 → 零到一条 Chat 消息（追加进 `messages`）
 ///
 /// `pending` 是跨项的 reasoning 暂存（见 [`PendingReasoning`]）：reasoning 项
 /// 自己不产生消息，只把正文交给相邻的 assistant 项。
+/// `images` 是跨项的工具图片暂存（见 [`PendingImages`]）：图片不能留在 tool
+/// 消息里，要攒到本轮工具结果全部落地之后才成一条 user 消息。
 fn push_input_item(
     messages: &mut Vec<Value>,
     item: &Value,
     pending: &mut PendingReasoning,
+    images: &mut PendingImages,
 ) -> Result<(), ConvertError> {
     let kind = string_field(item, "type").to_lowercase();
+    // 除了工具结果本身，任何项都是「这一轮工具到此为止」的下线点
+    if kind != "function_call_output" && kind != "custom_tool_call_output" {
+        images.flush(messages);
+    }
     match kind.as_str() {
         // 函数调用与其结果：合成 assistant(tool_calls) + tool 两条消息。
         // 上游要求 tool 消息必须紧跟对应的 assistant，所以这里一次推两条。
@@ -450,11 +520,25 @@ fn push_input_item(
             }
             messages.push(call_message);
         }
-        "function_call_output" => {
+        // 工具结果：文本进 tool 消息，图片攒起来另发（见 `PendingImages`）。
+        // 两种工具结果的形态同构，只是输出字段都叫 `output`，合一个分支处理
+        "function_call_output" | "custom_tool_call_output" => {
+            let output = tool_output_parts(item.get("output"));
+            for image in output.images {
+                images.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": image_url_of(&image) },
+                }));
+            }
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call_id_of(item),
-                "content": tool_output_text(item.get("output")),
+                // 只有图片时 `text` 是空串，占位文案理由见 [`TOOL_IMAGE_PLACEHOLDER`]
+                "content": if output.text.is_empty() {
+                    TOOL_IMAGE_PLACEHOLDER.to_string()
+                } else {
+                    output.text
+                },
             }));
         }
         // 自由文本工具（custom）的调用与结果：形态与 function_call 同构，只是
@@ -481,13 +565,6 @@ fn push_input_item(
                 freeform::wrap_freeform_input(&raw),
                 pending.attach(),
             ));
-        }
-        "custom_tool_call_output" => {
-            messages.push(json!({
-                "role": "tool",
-                "tool_call_id": call_id_of(item),
-                "content": tool_output_text(item.get("output")),
-            }));
         }
         // reasoning 项：正文不属于任何一轮对话，但**不能丢** —— 它要挂到本轮的
         // assistant 消息上（见 [`PendingReasoning`]）。这里只暂存，
@@ -658,24 +735,97 @@ fn text_blocks_of(blocks: Option<&Value>) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
-/// 工具输出 → 文本（Chat 的 tool 消息 content 只接受字符串）
+/// 工具输出拆出来的两部分（见 [`tool_output_parts`]）
+pub(super) struct ToolOutput {
+    /// 文本部分（可能为空串 —— 只有图片时由调用方决定补什么）
+    pub(super) text: String,
+    /// 图片块（原始块，调用方按目标协议转形态；url 取不到的已剔除）
+    pub(super) images: Vec<Value>,
+}
+
+/// 工具输出 → 文本 + 图片块。
+///
+/// ── 为什么必须拆开（真实事故，issue #76）──────────────────────
+/// Codex 的 `view_image` 把图片放在 `function_call_output.output` 的**数组**里：
+/// `[{type:"input_image", image_url:"data:image/png;base64,…"}]`
+/// （openai/codex 的 `FunctionCallOutputContentItem`；OpenAI 官方 schema 里
+/// `output` 也定义为 `String | Array[ResponseInputText | ResponseInputImage | …]`）。
+/// 原实现把整个数组用 `json_text` 拍平成 JSON **文本**塞进 tool 消息，两层后果：
+///
+///   1. 上游把 base64 当正文分词 —— 实测 token ≈ 字符数 × 0.69，一张 400KB 的
+///      截图就涨十几万 token，四张图能把 1M 上下文顶爆（报告的 325k → 973k）；
+///   2. 更致命的是模型**看不到图**，只看得到一坨 base64 —— 它会照上下文编一个
+///      答案出来，`view_image` 静默失效。
+///
+/// 所以图片必须单独拿出来（Chat 侧的落点见 [`PendingImages`]），文本照旧。
 ///
 /// `pub(super)`：出站方向（`responses_outbound`）把 chat 的 tool 消息折回
 /// `function_call_output` 时用同一口径，两处各写一份迟早分叉。
-pub(super) fn tool_output_text(output: Option<&Value>) -> String {
+pub(super) fn tool_output_parts(output: Option<&Value>) -> ToolOutput {
     let Some(output) = output else {
-        return "(empty)".to_string();
+        return text_only("(empty)".to_string());
     };
     match output {
         Value::String(text) => {
-            if text.is_empty() { "(empty)".to_string() } else { text.clone() }
+            if text.is_empty() { text_only("(empty)".to_string()) } else { text_only(text.clone()) }
         }
-        Value::Null => "(empty)".to_string(),
-        // 结构化输出（含图片等）：拍平成 JSON 文本，Chat 侧没有更好的表达
-        other => {
-            let text = json_text(other);
-            if text.is_empty() { "(empty)".to_string() } else { text }
+        Value::Null => text_only("(empty)".to_string()),
+        Value::Array(parts) => {
+            let images: Vec<Value> = parts
+                .iter()
+                .filter(|part| is_image_part(part) && !image_url_of(part).is_empty())
+                .cloned()
+                .collect();
+            let text = content_text(output);
+            if text.is_empty() && images.is_empty() {
+                // 一个块都认不出（例如只有音频）：保持原来的拍平兜底，
+                // 免得整段输出凭空消失
+                return text_only(json_text(output));
+            }
+            report_unknown_parts(parts);
+            ToolOutput { text, images }
         }
+        // 结构化输出（对象/数字等）：Chat 侧没有更好的表达，照旧拍平
+        other => text_only(json_text(other)),
+    }
+}
+
+fn text_only(text: String) -> ToolOutput {
+    ToolOutput { text, images: Vec::new() }
+}
+
+/// 是不是图片块（Responses 的 `input_image` 与 Chat 的 `image_url` 都认）
+fn is_image_part(part: &Value) -> bool {
+    matches!(
+        string_field(part, "type").to_lowercase().as_str(),
+        "input_image" | "image_url"
+    )
+}
+
+/// 记一条「工具输出里有表达不了的块」详细日志。
+///
+/// 与认不出的输入项同一取向（见 `push_input_item` 兜底分支）：宁可吵一点，
+/// 也要让「历史里莫名其妙少了东西」有据可查。
+fn report_unknown_parts(parts: &[Value]) {
+    let unknown: Vec<String> = parts
+        .iter()
+        .filter(|part| {
+            !part.is_string()
+                && !matches!(
+                    string_field(part, "type").to_lowercase().as_str(),
+                    "text" | "input_text" | "output_text" | "input_image" | "image_url"
+                )
+        })
+        .map(|part| {
+            let kind = string_field(part, "type");
+            if kind.is_empty() { "(缺 type)".to_string() } else { kind }
+        })
+        .collect();
+    if !unknown.is_empty() {
+        logging::log(
+            "[Responses]",
+            &format!("⚠️ 工具输出里的 {} 块跨协议表达不了，已丢弃", unknown.join(" / ")),
+        );
     }
 }
 
@@ -999,6 +1149,29 @@ pub fn response_envelope(
 }
 
 /// Chat 的 usage → Responses 的 usage（字段名与明细结构都不同）
+/// `finish_reason` 里的**失败信号** → `(code, 可读文案)`；`None` = 不是失败信号。
+///
+/// 目前只认 ZCode 活动套餐通道的 `network_error`（实测 2026-09-30：思考吃光
+/// 输出额度、上游内部熔断等情形会回它，而 HTTP 状态仍是 200、正文是空的）。
+///
+/// 这张表要**短而准**：认不出的取值继续按既有语义走（`length` →
+/// `max_output_tokens`、`content_filter` → `content_filter`、其余 → `completed`）。
+/// 把「没见过的值」一律判失败会误伤正常上游的扩展取值 —— 那类取值的正确处置
+/// 是补进这张表，而不是放宽判据。
+fn finish_failure(finish_reason: Option<&str>) -> Option<(&'static str, String)> {
+    match finish_reason? {
+        "network_error" => Some((
+            "upstream_network_error",
+            "上游报告 network_error：请求已到达上游但没有可用结果。\
+             活动套餐通道上最常见的原因是思考预算吃光了输出额度（正文因此为空，\
+             重试前请调高 max_tokens 或降低思考档位）；也可能是上游瞬时故障，\
+             可直接重试。"
+                .to_string(),
+        )),
+        _ => None,
+    }
+}
+
 pub fn usage_to_responses(usage: Option<&Value>) -> Value {
     let Some(usage) = usage.filter(|value| value.is_object()) else {
         return Value::Null;
@@ -1196,6 +1369,36 @@ impl ResponsesStream {
         }
         self.finished = true;
         out.extend(self.emit_created());
+        // 上游把失败写在 `finish_reason` 里时**如实失败**，不要落进「成功但空」。
+        // ZCode 的活动套餐通道在思考吃光输出额度这类情形下回
+        // `finish_reason:"network_error"`，它既不是 `length` 也不是
+        // `content_filter` —— 按「未知取值 = completed」处理的话，客户端收到的
+        // 是一个 `status:"completed"`、`output` 为空的响应（issue #52「200 但
+        // 回复为空」的表象），排查时也看不出上游其实报了错。
+        if let Some((code, message)) = finish_failure(self.finish_reason.as_deref()) {
+            let mut failed = response_envelope(
+                &self.response_id,
+                &self.model,
+                "failed",
+                Vec::new(),
+                usage_to_responses(self.usage.as_ref()),
+                &self.request,
+                self.created,
+                None,
+            );
+            if let Some(map) = failed.as_object_mut() {
+                map.insert(
+                    "error".to_string(),
+                    json!({ "code": code, "message": message }),
+                );
+            }
+            out.push(self.event(
+                "error",
+                json!({ "code": code, "message": message, "param": Value::Null }),
+            ));
+            out.push(self.event("response.failed", json!({ "response": failed })));
+            return out;
+        }
         out.extend(self.close_reasoning());
         // 上游什么都没给（空流）：补一条空 message，否则客户端解析不到 output
         if !self.text_open && self.tools.is_empty() {

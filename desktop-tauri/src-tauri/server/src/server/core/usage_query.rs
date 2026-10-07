@@ -31,17 +31,26 @@ pub struct TargetError {
     pub status_code: u16,
 }
 
-/// 批量操作的目标集合：**全部可用账号中被启用的那些**，外加被跳过的数量。
+/// 批量操作的目标集合：**全部可用账号**（`available: false` 的除外），外加
+/// 被跳过的数量。
 ///
 /// `provider`：`Some(id)` 只取该家；`None` 跨四家取（**余额查询**用它 ——
 /// 四家的余额接口各不相同、由各自适配器负责）。显式指定 id 时**不做过滤**
 /// （与「显式指定就执行」的既有语义一致）。
 ///
+/// ── 为什么不再按 `enabled` 过滤 ─────────────────────────────
+/// 禁用只表示「不参与转发」，与「这个账号还剩多少」无关 —— 与单查路径
+/// （`?id=`）的既有口径一致。按启用状态把批量 / 定时这一轮挡掉，界面上那些
+/// 行就永远是「未查询」，用户只能逐个手点「余额」按钮才看得到读数：定时查询
+/// 等于白跑（真实反馈：账号大多处于禁用状态时，余额列看起来像从没查过）。
+///
 /// 从 `api::accounts` 下沉（原 `resolve_batch_targets`）：它是纯粹的数据判定，
 /// 不含任何 HTTP 语义，而「定时查询积分」必须与手动查询用**同一份口径**
 /// —— 两条路径各写一份，「跳过了几个账号」这种算法迟早会漂。
 ///
-/// 返回 `(targets, skipped)`：`skipped` 是「可用账号里被禁用掉的数量」。
+/// 返回 `(targets, skipped)`：`skipped` 是「范围内**不可用**
+/// （`available: false`）的数量」—— 那些账号连凭证都不完整，查询只会稳定
+/// 失败，所以不进目标集合（与「已知必然失败就别发请求」同一取舍）。
 pub fn resolve_batch_targets(
     store: &AccountStore,
     provider: Option<&str>,
@@ -68,9 +77,6 @@ pub fn resolve_batch_targets(
     let is_available = |account: &Value| {
         account.get("available").and_then(Value::as_bool).unwrap_or(true)
     };
-    let is_enabled = |account: &Value| {
-        account.get("enabled").and_then(Value::as_bool).unwrap_or(true)
-    };
     if let Some(id) = id.filter(|value| !value.is_empty()) {
         let found: Vec<Value> = accounts
             .iter()
@@ -82,14 +88,16 @@ pub fn resolve_batch_targets(
         }
         return Ok((found, 0));
     }
-    let available: Vec<Value> = accounts
-        .into_iter()
-        .filter(in_scope)
-        .filter(is_available)
-        .collect();
-    let skipped = available.len();
-    let targets: Vec<Value> = available.into_iter().filter(is_enabled).collect();
-    let skipped = skipped - targets.len();
+    // 目标集合 = 范围内全部**可用**账号（不看 enabled，见函数头）；
+    // skipped 记的是范围内不可用的数量，供界面说清「为什么少了几行」
+    let (mut targets, mut skipped) = (Vec::new(), 0usize);
+    for account in accounts.into_iter().filter(in_scope) {
+        if is_available(&account) {
+            targets.push(account);
+        } else {
+            skipped += 1;
+        }
+    }
     Ok((targets, skipped))
 }
 
@@ -135,6 +143,10 @@ async fn query_usage_for(store: &AccountStore, account: &Value) -> Value {
 /// 的 401 做刷新重试会稳定失败，把一条「凭证过期」变成两条错误（刷新失败的信息
 /// 盖住真正原因，用户反而看不出该做什么）。
 ///
+/// 有刷新能力的家若刷新本身也失败，**两句都报**（原始 401 的原因 + 刷新失败的
+/// 上游说明 + 「重新登录」这条出路），不再让刷新那句盖掉原始原因 —— 只给
+/// `authorization_verify_error` 这种上游术语，用户看不出该做什么。
+///
 /// workbuddy 也走适配器：它的 `query_usage` 转调既有计费服务（结果形状不变）。
 async fn query_usage_inner(
     store: &AccountStore,
@@ -158,7 +170,18 @@ async fn query_usage_inner(
                 return Err(UsageFailure::Request(error.message, error.code));
             }
             if let Err(refresh_error) = adapter.refresh_access_token(store, id).await {
-                return Err(UsageFailure::Request(refresh_error.message, None));
+                // 刷新失败时**原始错误不能丢**：401 的两种含义（token 临期 /
+                // 登录态已被上游作废）在界面上是两件不同的事，只留刷新接口那句
+                // 上游术语（小浣熊是 `authorization_verify_error`）用户既看不懂、
+                // 也不知道该做什么。两句都给出，并明确「重新登录」这条出路
+                // ——这里能走到刷新，说明这家有续期能力，凭证失效的解法就是换一份。
+                return Err(UsageFailure::Request(
+                    format!(
+                        "{}；自动续期也失败：{}（登录态可能已被上游作废，请重新登录或重新导入该账号的凭证）",
+                        error.message, refresh_error.message
+                    ),
+                    error.code,
+                ));
             }
             adapter
                 .query_usage(store, id)
@@ -187,9 +210,10 @@ fn supports_usage(account: &Value) -> bool {
 /// 逐账号并发查询余额 / 积分汇总
 /// （`{ results: [{id,name,usage,error,code?}], skipped }`）。
 ///
-/// 目标集合是**全部启用账号**（`resolve_batch_targets(provider = None)`），逐账号
-/// 按 `provider` 分流到 `ProviderAdapter::query_usage`。改造前这条路径只查
-/// workbuddy —— 三家账号被静默跳过，前端连按钮都不给。
+/// 目标集合是**全部可用账号**（`resolve_batch_targets(provider = None)`，
+/// 不看启用状态，见那里的说明），逐账号按 `provider` 分流到
+/// `ProviderAdapter::query_usage`。改造前这条路径只查 workbuddy ——
+/// 三家账号被静默跳过，前端连按钮都不给。
 ///
 /// **并发**是关键：Node 版用 `Promise.all`，20 个账号串行会让前端转圈 20 次
 /// 往返。这里用 `join_all` 在同一个任务里并发轮询（每个 future 都是网络等待，
@@ -197,14 +221,15 @@ fn supports_usage(account: &Value) -> bool {
 /// **超时由各适配器自己设**（15~20 秒）；这里不叠加第二层超时 —— 那会让
 /// 「上游慢」与「网关掐断」在日志里无法区分。
 ///
-/// ── `id`：显式指定时**不看启用状态** ────────────────────────
-/// 批量路径只查启用账号是对的（禁用就是「别用它」，定时那一轮不该为它们发请求），
-/// 但**用户手点某一行账号的「积分」按钮**是另一个语义：那是在问「这个账号现在
-/// 还剩多少」。账号被禁用只说明它不参与转发，与其余额能不能查没有关系 ——
-/// 按启用状态把这次查询挡掉，界面只会得到一句「未返回余额数据」，用户看不出
-/// 是「禁用了」还是「上游挂了」。所以指定 id 时按 `resolve_batch_targets` 的
-/// 既有分支走（那条分支本就不做启用过滤），也不过滤 `supports_usage`：
+/// ── `id`：显式指定时只查这一个 ──────────────────────────────
+/// **用户手点某一行账号的「积分」按钮**问的是「这个账号现在还剩多少」。
+/// 账号被禁用只说明它不参与转发，与其余额能不能查没有关系 —— 按启用状态把
+/// 这次查询挡掉，界面只会得到一句「未返回余额数据」，用户看不出是「禁用了」
+/// 还是「上游挂了」。所以指定 id 时按 `resolve_batch_targets` 的单查分支走
+/// （那条分支只认 id，不做范围与可用性过滤），也不过滤 `supports_usage`：
 /// 能力过滤是给批量路径避免一整片 501 的，单查应当如实报「这家不支持」。
+/// 批量路径现在同样不看启用状态（见 `resolve_batch_targets`），两条路径的
+/// 唯一差别就是「查一个」还是「查全部可用」。
 ///
 /// 未知 id 由 `resolve_batch_targets` 报 404「账号不存在」。
 pub async fn query_all(store: &AccountStore, id: Option<&str>) -> Result<Value, TargetError> {
@@ -251,6 +276,8 @@ fn note_external_run() {
 ///
 /// **失败的行照样进快照**：定时查询的价值就在于「不点按钮也知道现在是好是坏」，
 /// 把失败悄悄丢掉会让界面永远停在上一轮的旧余额上（那是比显示失败更糟的误导）。
+/// （失败行的**时效**由出口把关：账号记录在快照之后变过就丢掉，见
+/// `prune_stale_failures` —— 进快照与端出去是两件事。）
 ///
 /// 成功 / 失败的判据是 `usage` 键是否为 null —— 与前端 `cacheEntryOf` 同源
 /// （它也是「有 usage 就是结果，否则是失败行」）。
@@ -283,9 +310,16 @@ pub fn store_snapshot(report: Value) -> (usize, usize) {
     (ok, failed)
 }
 
-/// 最近一次定时查询的快照。从未查过时给 `{at: 0, results: [], skipped: 0}` ——
-/// 界面据此显示「还没有定时查询结果」，而不是把空数组当成「一个账号都没有」。
-pub fn snapshot() -> Value {
+/// 最近一次定时查询的快照（**出口已按账号记录做过时效过滤**）。从未查过时给
+/// `{at: 0, results: [], skipped: 0}` —— 界面据此显示「还没有定时查询结果」，
+/// 而不是把空数组当成「一个账号都没有」。
+pub fn snapshot(store: &AccountStore) -> Value {
+    let raw = raw_snapshot();
+    prune_stale_failures(store, raw)
+}
+
+/// 快照的原始副本（内存命中 → 库里的持久化副本 → 空快照），不含时效过滤。
+fn raw_snapshot() -> Value {
     if let Ok(slot) = snapshot_slot().lock() {
         if let Some(value) = slot.as_ref() {
             return value.clone();
@@ -299,4 +333,50 @@ pub fn snapshot() -> Value {
         *slot = Some(restored.clone());
     }
     restored
+}
+
+/// 快照出口的**时效过滤**：丢掉「比账号记录还旧」的失败行，也丢掉账号已被删除的行。
+///
+/// ── 为什么只丢失败行、不丢成功读数 ──────────────────────────
+/// 失败行是对**当时那份凭证**的断言（「这个账号此刻查不到 / 续期不了」），而快照
+/// 是按账号 id 存的：账号删掉重新登录、重新导入、或 token 被刷新（记录的
+/// `updatedAt` 往前走）之后，那条断言就不再成立 —— 继续端出去只会让人以为账号
+/// 还是坏的。真实事故（2026-10-06）：两个小浣熊账号 12:39 重新登录成功、之后
+/// 转发与余额都正常，界面上却一直挂着上午 10:12 那一轮的「刷新接口失败
+/// （HTTP 401）」—— 重建的记录复用了同一个 `user-<userId>` id，旧结论被继承了。
+///
+/// 成功读数不受这条规则影响：「可用 5147 积分」是一次读数的事实，凭证换了它
+/// 也不会变成假话，界面本来就按「上次读数」展示（重启后先给上次结果，见
+/// `store_snapshot`）。若一并丢掉，重新登录后的账号会连余额一起变空白 ——
+/// 那是比「读数旧」更糟的结果。
+///
+/// 前端缓存里还有一份（`accounts-data.ts` 的 `usageEntryOf`，同一条判据）：本地
+/// 缓存不经过这个出口，重新登录后不必等下一轮查询才纠正。两边都要改。
+fn prune_stale_failures(store: &AccountStore, mut snapshot: Value) -> Value {
+    let at = snapshot.get("at").and_then(Value::as_i64).unwrap_or(0);
+    // at = 0：本进程还没查过（空快照），没有行可过滤
+    if at <= 0 {
+        return snapshot;
+    }
+    let changed = store.account_change_times();
+    let Some(results) = snapshot.get_mut("results").and_then(Value::as_array_mut) else {
+        return snapshot;
+    };
+    results.retain(|row| {
+        // 读不出 id 的行看不懂，原样留着（宁可不动它，也不猜着删）
+        let Some(id) = row.get("id").and_then(Value::as_str) else {
+            return true;
+        };
+        // 有读数的行不是失败结论，见函数头
+        if row.get("usage").is_some_and(|usage| !usage.is_null()) {
+            return true;
+        }
+        match changed.get(id) {
+            // 记录在快照之后被改过（重新登录 / 重导入 / 刷过 token）→ 旧结论作废
+            Some(changed_at) => *changed_at <= at,
+            // 账号已不在列表里：界面上没有那一行，留着只会让响应与账号列表对不上
+            None => false,
+        }
+    });
+    snapshot
 }

@@ -108,7 +108,10 @@ fn rebuild_day(conn: &rusqlite::Connection, day: NaiveDate) -> rusqlite::Result<
     // `next_start - 1` 是为了避开「夏令时切换当天次日零点不存在」这类边界
     // （`local_midnight_ms` 有兜底，但让它只负责一个方向更简单）
     let end = local_midnight_ms(day + ChronoDuration::days(1)).saturating_sub(1);
-    let entries = sql::select_between(conn, start, end)?;
+    // 重算与实时累加（`fold_into_daily` 的两条调用路径）必须同口径：
+    // 测试行两边都不折进聚合（见 `RequestEntry::is_test`），否则「重算过一天」
+    // 会让那天的数字与重算前对不上
+    let entries = sql::select_between(conn, start, end, true)?;
     if entries.is_empty() {
         daily::delete_daily(conn, &key)?;
         return Ok(());

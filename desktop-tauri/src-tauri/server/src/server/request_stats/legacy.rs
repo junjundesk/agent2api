@@ -266,8 +266,10 @@ pub(crate) fn import_legacy_daily(
     let entries = match (sql::min_ts(&tx)?, sql::max_ts(&tx)?) {
         // 明细在这两个时间之间全取 —— 回填的判据要看「某天有多少条明细」，
         // 只取候选日会需要先知道候选日（那正是 backfill 内部算的），
-        // 全取一次更简单；上限 2 万条，一次性迁移可以接受
-        (Some(min), Some(max)) => sql::select_between(&tx, min, max)?,
+        // 全取一次更简单；上限 2 万条，一次性迁移可以接受。
+        // 这一份是「旧库回填」（构建某天的聚合行），与实时累加同口径：
+        // 排除测试行（见 `select_between` 与 `RequestEntry::is_test`）
+        (Some(min), Some(max)) => sql::select_between(&tx, min, max, true)?,
         _ => Vec::new(),
     };
     let changed = backfill::rebuild_legacy_days(&mut stored, &entries);

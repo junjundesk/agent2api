@@ -576,6 +576,11 @@ impl TrafficCapture {
         guard.body.push_str(&String::from_utf8_lossy(chunk));
     }
 
+    #[cfg(test)]
+    pub(crate) fn captured_body(&self) -> String {
+        self.lock().body.clone()
+    }
+
     /// 落库（幂等：第二次调用什么都不做）。
     ///
     /// 没真发过请求（`sent` 为假）时直接丢弃：那种报文除了 id 什么都没有

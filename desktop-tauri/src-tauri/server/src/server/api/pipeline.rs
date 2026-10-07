@@ -359,6 +359,13 @@ pub struct RecordContext {
     /// 非流式路径在记账前由入口直接填（完整 JSON）；流式路径构造时是 None，
     /// 由 `RecordingStream` 在流结束时用累积缓冲定稿 —— 那时才见得到最后一个字节。
     pub raw_response: Option<String>,
+    /// 这条请求是不是**模型测试**发起的（默认 false，见
+    /// `request_stats::RequestEntry::is_test`）。
+    ///
+    /// 只有 `api::model_test` 传 true：测试与真实请求走同一条转发链路、明细
+    /// 同形，唯一的分野就是「谁发起的」—— 存档时要能把它标出来（报表排除、
+    /// 请求日志标记）。
+    pub is_test: bool,
 }
 
 /// 把原始字节变成可入库的正文文本（请求侧 / 响应侧共用）。
@@ -408,6 +415,8 @@ pub fn record_early_failure(
         // 请求侧的正文可能解析都没解析成功，存半截没有意义
         raw_request: None,
         raw_response: None,
+        // 早失败路径只有真实流量会走（模型测试自己那条失败在 handler 里收尾）
+        is_test: false,
     };
     record_entry(&context, Some(error.message.clone()));
 }
@@ -561,6 +570,8 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     // 两处各写一遍迟早会让进行中行与收尾行显示成两种样子。
     entry.attempt_details = stored_attempt_details(&snapshot.attempts_detail);
     entry.sensitive_hits = stored_sensitive_hits(&snapshot.sensitive_hits);
+    // 来源标记：入口带进来的事实，存储层据此排除报表聚合（见该字段的说明）
+    entry.is_test = context.is_test;
     entry.error = error;
     entry.prompt_tokens = snapshot.prompt_tokens;
     entry.completion_tokens = snapshot.completion_tokens;

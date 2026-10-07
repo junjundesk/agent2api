@@ -39,7 +39,9 @@ type ProviderFeatures = {
   identifier: string
   /** 有效期落在记录里的哪个键（expiresAt / tokenExpiresAt） */
   expiry: string
-  /** 「这家的账号就该以邮箱报名字」（Qoder / AutoClaw 国际版），见 accountCell 的说明 */
+  /** 「这家的账号以邮箱报名字」（Qoder / AutoClaw 国际版 / Accio）。两处消费：
+   *  displayNameOf（**未设备注**账号的主名口径，设过备注的以备注名为主）与
+   *  models-fetch-modal 的 accountLabel（拉取模型的账号下拉） */
   emailAsName?: boolean
   /** 有没有「领体验套餐」这个动作（只有 ZCode 两家） */
   claim?: boolean
@@ -82,6 +84,13 @@ type ProviderFeatures = {
  */
 const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   workbuddy: { usage: true, checkin: true, edition: true, identifier: 'uid', expiry: 'expiresAt' },
+  // WorkBuddy 国际版（拆家后的第二家，见 providers::workbuddy::region）：
+  //   · `checkin: false` 是事实 —— 腾讯的每日签到只有国内站有（拆家前靠
+  //     `edition !== 'intl'` 排除，现在由 provider 身份表达，那层排除随之多余）；
+  //   · `edition: false` 是因为注册名「WorkBuddy 国际版」自带地区，再拼一次会
+  //     得到「WorkBuddy 国际版 国际版」（`editionSuffix` 虽有「名字已含就不拼」
+  //     的兜底，这里直接写 false 更清楚，与 `zcode-intl` 同款）。
+  'workbuddy-intl': { usage: true, checkin: false, edition: false, identifier: 'uid', expiry: 'expiresAt' },
   raccoon: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
   catpaw: { usage: true, checkin: false, edition: false, identifier: 'uid', expiry: 'tokenExpiresAt' },
   // AutoClaw 两个地区能力完全一致，差别只在域名；两项都必须登记 —— 漏了哪一项，
@@ -133,6 +142,16 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // 且它记的「签到钱包」与模型调用真正扣的积分池是两笔钱 —— 不给按钮，免得给一个
   // 点了必然报错（或报出一个对不上官方数字的余额）的入口。
   trae: { usage: true, checkin: false, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  // Loomy（讯飞）。三位各有出处：
+  // `usage: true` 对应 providers::loomy::balance —— 余额是**双账户**（永久积分 +
+  //   每日赠送积分，读 `GET /api/v2/points/records` 的摘要字段），界面上两张卡都列。
+  // `checkin: true` —— 本家**没有**独立签到接口，但「每日赠送积分」由每日首次登录
+  //   自动刷新（`POST /api/v1/points/first-login`），已接进自动签到框架
+  //   （见 providers::loomy::checkin 的模块头）。勾选框里的签到对它就是这个调用。
+  // `edition: false` —— 单一入口（手机验证码登录），没有国际版/地区概念。
+  // `expiry: 'expiresAt'` —— 落账号时按登录时刻 + 14 天估算（上游没有续期接口，
+  //   过期只能重新登录；这一列对它是「什么时候该重登」的提示）。
+  loomy: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
 }
 
 /**
@@ -184,7 +203,15 @@ export function providerSummaries(snapshot: AccountsSnapshot | null | undefined)
     if (known.has(id)) return
     known.set(id, { id, label: shared().wbProviders?.labelOf?.(id) || id, count })
   })
-  if (!known.size) known.set(DEFAULT_PROVIDER_ID, { id: DEFAULT_PROVIDER_ID, label: 'WorkBuddy', count: 0 })
+  // 摘要还没到时的兜底项：名字优先问注册表，问不到才用字面量 —— 与
+  // add-provider-pick 那张卡的兜底同一口径（拆家后注册名带「国内版」）
+  if (!known.size) {
+    known.set(DEFAULT_PROVIDER_ID, {
+      id: DEFAULT_PROVIDER_ID,
+      label: shared().wbProviders?.labelOf?.(DEFAULT_PROVIDER_ID) || 'WorkBuddy 国内版',
+      count: 0,
+    })
+  }
   return [...known.values()]
 }
 
@@ -194,11 +221,27 @@ export function identifierOf(account: AccountRecord | null | undefined): string 
   return String(account?.[key] || '')
 }
 
+/**
+ * 到期时刻**归一到毫秒**：库里落盘的单位在秒与毫秒之间漂过 —— CPA 的 auth 文件与
+ * 手工粘贴进来的是 10 位秒，别家与上游刷新响应都是 13 位毫秒。不归一的后果不是
+ * "少三位精度"而是整条账号被判死：`1791009732`（秒）当毫秒读是 1970-01-21，
+ * 有效期那一列直接显示「已过期」，而它的令牌其实还有几天。
+ *
+ * 1e11 这个分界与后端 `providers::trae::Credential::expires_at_ms` **同一个口径**
+ * （1e11 秒 ≈ 公元 5138 年，真正的毫秒时间戳不可能小于它），两处注释互相指着对方，
+ * 改数值时要一起改。0 与负数原样返回：那代表"记录里没给到期时刻"，不能捏成
+ * 一个 1970 年的时间戳。
+ */
+export function expiryMillis(value: unknown): number {
+  const raw = Number(value) || 0
+  if (raw <= 0) return 0
+  return raw < 1e11 ? raw * 1000 : raw
+}
+
 /** token 过期时间戳（毫秒，0 表示记录里没有这个字段） */
 export function tokenExpiryOf(account: AccountRecord | null | undefined): number {
   const key = providerFeatures(providerOf(account)).expiry
-  const value = Number(account?.[key])
-  return Number.isFinite(value) ? value : 0
+  return expiryMillis(account?.[key])
 }
 
 /** 该账号所属 provider 是否有余额概念（没有就不渲染余额按钮，也不参与批量查询） */
@@ -218,6 +261,18 @@ export function isDesktopAccount(account: AccountRecord | null | undefined): boo
  */
 export function supportsChat(account: AccountRecord | null | undefined): boolean {
   return account?.chatSupported !== false
+}
+
+/**
+ * 自定义提供商的 id 判据（`custom-` 前缀）。
+ *
+ * 与后端 `custom_providers::is_custom_provider_id` 的**第一半**一致：那边还要求
+ * 「能在配置里找到这家」（判「这个 id 是不是真家」），界面这里问的是另一件事 ——
+ * 「这条账号是不是自定义形态」，提供商被删后残留的账号同样要按自定义形态展示
+ * （与后端 `to_custom_public_account` 用前缀分派同一取向）。
+ */
+export function isCustomProviderId(provider: string | null | undefined): boolean {
+  return typeof provider === 'string' && provider.startsWith('custom-')
 }
 
 export function typeLabel(type: string | undefined): string {
@@ -572,9 +627,23 @@ export function positionMap(all: AccountRecord[] | null | undefined): Map<string
 
 /* ─── 展示派生 ─────────────────────────────── */
 
-/** 账号展示名（昵称优先，退化到备注名 / 标识 / id） */
+/**
+ * 账号展示名，纯 nameCustom 分流（两条线，不按家再分叉）：
+ *   · 用户显式设置过备注名（打标，见后端 apply_patch / mark_name_custom）—— 备注名恒为主名；
+ *   · 未打标 —— 维持历史口径：「以邮箱报名字」的三家（Qoder / AutoClaw 国际版 / Accio）
+ *     邮箱优先，其余昵称优先，再退备注名种子 / 标识 / id。
+ * 备注名种子与用户改的名在记录里无法区分，全靠 nameCustom 分流 —— 没有它，
+ * 「备注名优先」会让未设备注的账号顶掉邮箱 / 昵称，显示成建号时的种子值。
+ * （中间版本试过「非邮箱系家名字优先」的放宽，好处是更新前的旧备注免重存生效，
+ *  代价是取名规则按家分叉、解释成本高 —— 已按用户决定回归纯标记这一条线。）
+ */
 export function displayNameOf(account: AccountRecord | null | undefined): string {
-  return account?.nickname || account?.name || identifierOf(account) || account?.id || ''
+  if (!account) return ''
+  const name = String(account.name || '').trim()
+  if (account.nameCustom === true && name) return name
+  const email = String(account.email || '').trim()
+  if (providerFeatures(providerOf(account)).emailAsName && email) return email
+  return account?.nickname || name || identifierOf(account) || account?.id || ''
 }
 
 /** 无有效恢复时间时的退化文案：它本身就是完整一句，调用方据此不再拼「，恢复时间：」 */
@@ -641,6 +710,19 @@ export function accountTags(account: AccountRecord): AccountTag[] {
     // 留着是为了「将来某家处于只有账号管理的过渡期」时界面能自己说清楚
     supportsChat(account)
       ? null : { text: '仅账号管理', kind: 'plain' as const, title: '该提供商的推理转发尚未接入，账号不参与转发' },
+    // 自定义账号没有凭证：既没填 API Key、也没勾「无需鉴权」时，它在选路里会被
+    // **静默跳过**（后端 hasCredentials = false，目录也不广告它家的模型）——原样
+    // 展示成一条普通账号会让用户完全看不出「为什么加了账号却发不出去请求」。
+    // 判据用后端注入的 hasCredentials（所有家都有这个字段，但只有自定义家会为
+    // false —— 其它家的凭证各有各的链路），再限定 id 前缀避免误报。
+    isCustomProviderId(providerOf(account)) && account.hasCredentials === false
+      ? {
+        text: '未配置凭证',
+        kind: 'bad' as const,
+        title: '这条自定义账号既没有 API Key，也没有勾选「无需鉴权」：转发时会被跳过，'
+          + '该提供商下的模型也不会出现在模型列表里。去账号「设置」里补上 Key，或勾选「该上游无需鉴权」',
+      }
+      : null,
     // 代理配了解析不出来时明确标出：转发会回退直连，属于需要留意的情况
     account.proxy?.error
       ? { text: '代理异常', kind: 'bad' as const, title: `${account.proxy.error}（转发时会回退直连）` }

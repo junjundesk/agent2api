@@ -392,7 +392,7 @@ fn import_one_item(
         }
         // 非 WorkBuddy 记录不该带腾讯端点字段：旧版导入曾把它们注入别家记录，
         // 这里在合并时清掉（其余各家的适配器都不读这些键，见各家凭证模块）
-        if provider != kind_id(ProviderKind::WorkBuddy) {
+        if !crate::server::core::providers::workbuddy::is_workbuddy_family(&provider) {
             for key in ["edition", "prefixPath", "endpoint", "platform"] {
                 state.accounts[index].remove(key);
             }

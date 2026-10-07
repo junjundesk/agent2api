@@ -264,6 +264,11 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // 症状正是本文件上面警告的那种 —— 窗口一片空白，日志什么也看不出。
         "catpaw" | "qoder" | "cline-free" | "cline-pass" | "autoclaw" | "autoclaw-intl"
         | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae" => None,
+        // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
+        // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
+        // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
+        // （拆家后 `workbuddy-intl` 是新 id，靠默认分支时读者无从判断）。
+        "workbuddy" | "workbuddy-intl" => Some(WORKBUDDY_ALLOWED_HOSTS),
         _ => Some(WORKBUDDY_ALLOWED_HOSTS),
     }
 }
@@ -275,7 +280,7 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
 /// 和「拦下回调」在 WebView2 眼里是同一个动作，日志里看不出区别，
 /// 最终表现为「用户登录成功了但网关一直没拿到 code」。
 ///
-/// `social_restore` 勾选时对 workbuddy 额外放行 [`SOCIAL_IDENTITY_HOSTS`]：
+/// `social_restore` 勾选时对 WorkBuddy 国际版额外放行 [`SOCIAL_IDENTITY_HOSTS`]：
 /// 恢复出来的 Google / GitHub 按钮做的是顶层跳转，不放行就会白屏（理由见该常量）。
 fn host_allowed(url: &url::Url, provider: &str, social_restore: bool) -> bool {
     match url.scheme() {
@@ -293,8 +298,13 @@ fn host_allowed(url: &url::Url, provider: &str, social_restore: bool) -> bool {
                 list.iter()
                     .any(|item| host == *item || host.ends_with(&format!(".{item}")))
             };
+            // `social_restore` 到这里已经是**最终答案**（调用方把「WorkBuddy
+            // 系 + 国际版 + 用户勾选」三件事合成一个布尔值传进来，见
+            // `run_embedded` 的调用点），这里不再重复判 provider —— 重复判的
+            // 后果是拆家后国际版（`workbuddy-intl`）被挡住，Google / GitHub
+            // 按钮点下去白屏。
             matched(allowed)
-                || (social_restore && provider == "workbuddy" && matched(SOCIAL_IDENTITY_HOSTS))
+                || (social_restore && matched(SOCIAL_IDENTITY_HOSTS))
         }
         // 非 http(s) 的其它协议一律拒绝（除了上面的 about / data）：
         // 白名单之外的自定义协议在 WebView2 里会被交给系统处理，不该由登录页触发
@@ -400,6 +410,11 @@ fn navigate_login_window(app: &AppHandle, label: &str, target: &str) {
 fn normalize_provider(provider: &str) -> Result<&'static str, String> {
     match provider.trim() {
         "" | "workbuddy" => Ok("workbuddy"),
+        // WorkBuddy 国际版（2026-10 拆家后是独立 provider）：面板那块
+        // 「账号版本」分段按选中项算 provider id，国际版登录走的是同一个
+        // 内嵌窗口流程，差别只在后端按它落哪一组账号。**这一条不能少** ——
+        // 少了它前端会收到「未知的 provider」而登录按钮直接失败。
+        "workbuddy-intl" => Ok("workbuddy-intl"),
         "raccoon" => Ok("raccoon"),
         "qoder" => Ok("qoder"),
         "catpaw" => Ok("catpaw"),
@@ -657,6 +672,11 @@ pub async fn start(
         // provider id 里，就不该再去读一个恒为空的形参。
         "zcode" => "cn",
         "zcode-intl" => "intl",
+        // WorkBuddy 国际版同理（拆家后它是独立 provider）：归属已经在 provider id
+        // 里，这里只把它翻成标题/日志用的地区名。面板仍会同时传 `edition`
+        // （同一块里的分段控件），两者一致时无所谓，不一致时**以 provider 为准**
+        // —— 与后端 `login_start` 的口径相同（见 api::session 的说明）。
+        "workbuddy-intl" => "intl",
         _ => {
             if edition == "intl" { "intl" } else { "cn" }
         }
@@ -744,7 +764,14 @@ pub async fn start(
     //   ② 只有国际版登录页被上游隐藏了入口 —— 国内版登录页是微信 / 手机号 /
     //      邮箱 / SSO，既没有 Google / GitHub 按钮，也没有那段隐藏样式（实测），
     //      对它放行 google.com 之类的域名属于没有必要的放宽。
-    let social_restore = social_restore && provider == "workbuddy" && edition_id == "intl";
+    // 判据取**地区**而不是某个 id：拆家后国际版是 `workbuddy-intl`，
+    // 写单 id 会让它的登录页不再恢复第三方入口（症状是 Google / GitHub 按钮
+    // 点了白屏 —— 与国内版没有那两个按钮是两回事）。
+    let intl_workbuddy = {
+        use agent2api_server::server::core::providers::workbuddy::Region;
+        Region::from_provider_id(provider).is_some_and(|region| region != Region::Cn)
+    };
+    let social_restore = social_restore && intl_workbuddy;
     let result = if use_external {
         open_external(app, &auth_url, edition_label, &login_state).await
     } else {

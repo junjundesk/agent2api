@@ -10,7 +10,7 @@ use crate::server::logging;
 
 use super::priority::next_free_priority;
 use super::sql;
-use super::state::StoredAccount;
+use super::state::{mark_name_custom, StoredAccount};
 use super::store::{AccountStore, AccountStoreError};
 use super::store_util::{max_concurrent_public, token_tail_of, truncate_chars};
 use super::CredentialWrite;
@@ -96,6 +96,7 @@ impl AccountStore {
         fields.insert("id".to_string(), Value::String(id.clone()));
         fields.insert("provider".to_string(), Value::String(PROVIDER.to_string()));
         fields.insert("name".to_string(), Value::String(truncate_chars(&record_name, 100)));
+        mark_name_custom(&mut fields, name.is_some_and(|value| !value.trim().is_empty()), existing.as_ref());
         fields.insert("tokenTail".to_string(), Value::String(token_tail_of(&credentials.access_token)));
         fields.insert("priority".to_string(), Value::from(priority));
         fields.insert("enabled".to_string(), Value::Bool(existing.as_ref().map(StoredAccount::enabled).unwrap_or(true)));

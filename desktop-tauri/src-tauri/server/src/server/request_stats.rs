@@ -361,10 +361,18 @@ impl RequestStats {
             // 带子查询的删除语句（见 `sql::trim_requests_capacity` 的说明）。
             sql::trim_requests_capacity(&tx, MAX_ENTRIES)?;
             // 聚合：**读-改-写当天那一行**（为什么不是增量的 UPDATE：见 `sql.rs` 模块头）
-            let mut day = daily::select_daily_row(&tx, &date)?
-                .unwrap_or_else(|| DailyEntry::new(date.clone()));
-            fold_into_daily(&mut day, &record);
-            daily::upsert_daily(&tx, &day)?;
+            //
+            // 模型测试的行**不折进聚合**（见 `RequestEntry::is_test`）：明细照记
+            // （请求日志要能看到它、要能对照），但报表回答的是「真实流量长什么样」，
+            // 把人工反复发起的样本混进总量与趋势里会把它读歪。判据只有这一处
+            // 与 `rebuild_day` 那处，两处必须同口径 —— 否则「重算过一天」会让
+            // 那天的数字与重算前对不上。
+            if !record.is_test {
+                let mut day = daily::select_daily_row(&tx, &date)?
+                    .unwrap_or_else(|| DailyEntry::new(date.clone()));
+                fold_into_daily(&mut day, &record);
+                daily::upsert_daily(&tx, &day)?;
+            }
             daily::delete_daily_before(&tx, &bounds.daily_key)?;
             daily::trim_daily_capacity(&tx, MAX_DAILY_DAYS)?;
             tx.commit()
@@ -396,14 +404,25 @@ impl RequestStats {
     /// 同 id 已有进行中行时跳过（重复调用不产生第二行）；库不可用时静默跳过
     /// —— 这一步的失败只是「列表里晚一点才看到这条请求」，与统计整体的
     /// 「少记不影响请求」同一取向。
-    pub fn record_started(&self, id: &str, ts: i64, model: &str, client_model: &str, client_reasoning: &str) {
+    /// ── 来源标记（`is_test`，schema v7）───────────────────────────
+    /// 与 id / ts 同一时刻定稿：它是**入口**（`api::model_test`）才知道的事实，
+    /// 随进行中行一起写下来，于是「进行中」那一段的测试行也一眼可辨。
+    pub fn record_started(
+        &self,
+        id: &str,
+        ts: i64,
+        model: &str,
+        client_model: &str,
+        client_reasoning: &str,
+        is_test: bool,
+    ) {
         if id.is_empty() {
             return;
         }
         let guard = self.guard();
         let _ = self.with_conn_mut(&guard, |conn| {
             let tx = conn.transaction()?;
-            sql::insert_started_request(&tx, id, ts, model, client_model, client_reasoning)?;
+            sql::insert_started_request(&tx, id, ts, model, client_model, client_reasoning, is_test)?;
             // 陈旧清理与插入同事务：僵尸行的判定时点与本次开始时点一致，
             // 中断也只影响「这次有没有清成」，不会留下半删状态
             sql::finish_stale_running(&tx, stale_cutoff(), now_ms())?;
@@ -572,7 +591,9 @@ impl RequestStats {
             let guard = self.guard();
             self.with_conn(&guard, |conn| {
                 let daily = daily::select_daily_map(conn)?;
-                let entries = sql::select_between(conn, now - SUMMARY_WINDOW_MS, now)?;
+                // 报表侧排除模型测试（见 `select_between` 的说明）：
+                // 趋势图与排行回答的是「真实流量长什么样」
+                let entries = sql::select_between(conn, now - SUMMARY_WINDOW_MS, now, true)?;
                 Ok((daily, entries))
             })
         };

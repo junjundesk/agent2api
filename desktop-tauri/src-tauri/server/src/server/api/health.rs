@@ -75,7 +75,10 @@ pub async fn handle(State(state): State<ServerState>) -> Response {
         "authRequired": snapshot.api_key_set(),
         "defaultModel": snapshot.default_model(),
         // 模型目录条数（对照 Node 的 `models: modelCatalog.list().length`）——
-        // 切片 4 起是真值：目录未刷新过时是内置清单条数，刷新后是远程清单条数
+        // 切片 4 起是真值：目录未刷新过时是内置清单条数，刷新后是远程清单条数。
+        // **只算国内版**：本字段是「唯一上游时代」的契约读数（Node 只有一个
+        // workbuddy 目录），而拆家后国际版是独立 provider、有自己的一份清单 ——
+        // 完整的可用清单看 `/v1/models`（聚合视图），这里保持旧口径不变。
         "models": state.models().count(),
     }))
 }

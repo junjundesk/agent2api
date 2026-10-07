@@ -35,7 +35,13 @@ import { createRoot } from 'react-dom/client'
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogSection, DialogTitle } from '@ui'
 
 import { shared, type CustomProviderRecord, type SharedWindow } from './add-account-bridge'
-import { BUILTIN_CONFIGS, CUSTOM_PROVIDER, WORKBUDDY_PROVIDER, configOf } from './add-account-configs'
+import {
+  BUILTIN_CONFIGS,
+  CUSTOM_PROVIDER,
+  WORKBUDDY_ENTRY_LABEL,
+  WORKBUDDY_PROVIDER,
+  configOf,
+} from './add-account-configs'
 import { CustomFootActions, CustomProviderBlock, type CustomMode } from './add-custom-provider'
 import { ImportFootActions, ImportPanel } from './add-provider-import'
 import {
@@ -144,7 +150,12 @@ function AddAccountModal({
     : state.presetKey
       ? shared().wbPresetProviders?.presetOf?.(state.presetKey)?.name || ''
       : ''
-  const providerLabel = shared().wbProviders?.labelOf?.(state.provider) || state.provider
+  // WorkBuddy 用中性品牌名（不带地区）：这个块内部有「账号版本」分段，标题写着
+  // 「国内版」而用户当场切到国际版就自相矛盾了（与第 1 步那张卡同一口径，名字
+  // 见 add-account-configs 的 WORKBUDDY_ENTRY_LABEL）。别家用注册表名。
+  const providerLabel = state.provider === WORKBUDDY_PROVIDER
+    ? WORKBUDDY_ENTRY_LABEL
+    : shared().wbProviders?.labelOf?.(state.provider) || state.provider
   // 标题写在表单弹窗的头部：列表弹窗的标题始终是「添加账号」，不跟着步骤变
   const heading = isCustom
     ? (state.providerHint || state.presetKey

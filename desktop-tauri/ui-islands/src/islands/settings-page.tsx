@@ -51,6 +51,7 @@ import {
   addProviderPrompt,
   addRetryCode,
   applyUnits,
+  cancelLanRegister,
   clearDegrade,
   dropLastRetryCode,
   exportAccounts,
@@ -58,6 +59,8 @@ import {
   load,
   panelLogout,
   refreshDebug,
+  refreshClineHeaders,
+  refreshCors,
   refreshPrompt,
   refreshQueue,
   refreshRetention,
@@ -68,15 +71,19 @@ import {
   removeProviderPrompt,
   removeRetryCode,
   renderDebug,
+  renderCors,
   renderPrompt,
   renderRetention,
   renderRetry,
   renderSanitize,
   renderSettings,
   renderStorage,
+  resolveLanConfirm,
   resolveRetentionConfirm,
   restoreCategory,
   saveCaptcha,
+  saveClineHeaders,
+  saveCors,
   saveDebug,
   savePromptFile,
   savePromptMode,
@@ -91,8 +98,14 @@ import {
   saveToggle,
   selectCategory,
   showCategory,
+  submitLanRegister,
+  toggleLan,
+  toggleLanPanel,
   useSettings,
+  type ClineHeadersState,
   type DebugState,
+  type LanConfirm,
+  type LanRegister,
   type LoadStatus,
   type NumericState,
   type PromptState,
@@ -282,6 +295,15 @@ function RefreshButton({ id, onClick }: { id: string; onClick: () => void }) {
 
 /* ─── 通用分类 ─────────────────────────────── */
 
+/** 「局域网访问」面板的状态行：开着时给出局域网设备该填的 API 地址 */
+function lanStateText(snap: SettingsSnapshot): string {
+  const { lanAccess, lanPanel, lanIp, port } = snap.app
+  if (!lanAccess) return '未开启：网关只监听 127.0.0.1，仅本机可以访问。'
+  const base = `http://${lanIp || '<本机IP>'}${port ? `:${port}` : ''}`
+  const panel = lanPanel ? '；网页管理面板已一并开放（浏览器打开同一地址）' : ''
+  return `已开启：其他设备把 API 地址指向 ${base}/v1${panel}。`
+}
+
 function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
   const app = snap.app
   const appState = app.status === 'unavailable'
@@ -324,6 +346,33 @@ function GeneralPane({ snap }: { snap: SettingsSnapshot }) {
           <div className='settings-state'>{appState}</div>
         </div>
       </section>
+
+      {!snap.panelLogin && (
+        <section className='panel'>
+          <PanelHead title='局域网访问' tip={TIPS.lan} />
+          <div className='panel-body'>
+            <div className='settings-switches'>
+              {/* 开 / 关都不直接落盘：走确认框（→ 需要时注册管理员 → 写设置并重启），
+                  流程与文案在 settings-state 的 toggleLan / resolveLanConfirm */}
+              <SwitchRow
+                id='settings-lan-access'
+                label='允许局域网内的设备访问网关'
+                checked={snap.app.lanAccess}
+                disabled={snap.busy === 'lan'}
+                onCheckedChange={toggleLan}
+              />
+              <SwitchRow
+                id='settings-lan-panel'
+                label='同时开放网页管理面板'
+                checked={snap.app.lanPanel}
+                disabled={snap.busy === 'lan' || !snap.app.lanAccess}
+                onCheckedChange={toggleLanPanel}
+              />
+            </div>
+            <div className='settings-state'>{lanStateText(snap)}</div>
+          </div>
+        </section>
+      )}
 
       <section className='panel'>
         <PanelHead title='计量单位' tip={TIPS.units} />
@@ -1104,6 +1153,8 @@ function GatewayPane({ snap }: { snap: SettingsSnapshot }) {
         </div>
       </section>
 
+      <ClineHeadersPanel snap={snap} />
+
       <PromptPanel snap={snap} />
 
       <section className='panel'>
@@ -1135,6 +1186,162 @@ function GatewayPane({ snap }: { snap: SettingsSnapshot }) {
   )
 }
 
+/* ─── Cline 伪装头（网关分类）───────────────── */
+
+/** 伪装头面板的可编辑行：默认行的键锁定，自定义行的键可写 */
+type ClineHeaderRow = { key: string; value: string; isDefault: boolean }
+
+/**
+ * 从快照拼出可编辑的行：默认清单全量在前（保持后端给的顺序），覆盖表里
+ * 多出来的自定义头跟在后面。默认行的值取「覆盖值优先」（空串 = 用户显式
+ * 删了这个头），自定义行原样来自覆盖表。
+ */
+function clineRowsFrom(state: ClineHeadersState): ClineHeaderRow[] {
+  const rows: ClineHeaderRow[] = Object.entries(state.defaults).map(([key, value]) => ({
+    key,
+    value: key in state.overrides ? state.overrides[key] : value,
+    isDefault: true,
+  }))
+  for (const [key, value] of Object.entries(state.overrides)) {
+    if (!(key in state.defaults)) rows.push({ key, value, isDefault: false })
+  }
+  return rows
+}
+
+/** 两张覆盖表是否等价（键集合 + 每个键的值，与键序无关） */
+function sameOverrides(a: Record<string, string>, b: Record<string, string>): boolean {
+  const keys = Object.keys(a)
+  if (keys.length !== Object.keys(b).length) return false
+  return keys.every(key => a[key] === b[key])
+}
+
+/**
+ * Cline 伪装头面板：一张「头名 → 头值」的行编辑器。
+ *
+ * 编辑都在**本组件的草稿**里进行（与 NumberRow 同一取向，只是整张表一份草稿）；
+ * 后端值一变（加载完成 / 保存成功 / 刷新 / 失败回滚）草稿整体重置。「保存」把
+ * 草稿折算成覆盖表交给状态层 —— 默认行改回了默认不进表（后端存的是「改过的
+ * 键」，不是全量配置）、默认行值留空 = 这个头不发、自定义行必须有名有值。
+ */
+function ClineHeadersPanel({ snap }: { snap: SettingsSnapshot }) {
+  const state = snap.clineHeaders
+  const [rows, setRows] = React.useState<ClineHeaderRow[]>(() => clineRowsFrom(state))
+  React.useEffect(() => { setRows(clineRowsFrom(state)) }, [state])
+
+  const busy = snap.busy === 'clineHeaders'
+  const ready = state.status === 'ready'
+
+  function updateRow(index: number, patch: Partial<ClineHeaderRow>): void {
+    setRows(current => current.map((row, i) => (i === index ? { ...row, ...patch } : row)))
+  }
+
+  function buildOverrides(): Record<string, string> {
+    const out: Record<string, string> = {}
+    for (const row of rows) {
+      const key = row.key.trim()
+      if (!key) continue
+      if (row.isDefault) {
+        if (row.value !== (state.defaults[key] ?? '')) out[key] = row.value
+      } else if (row.value !== '') {
+        out[key] = row.value
+      }
+    }
+    return out
+  }
+
+  // 与后端的覆盖表比「键值是否相同」，**不比对键序**：草稿按行顺序产出（默认行
+  // 在前、自定义行追加在后），而后端的 BTreeMap 是字典序 —— 串起来比字符串会让
+  // 「覆盖了某个默认头 + 加了一个排序在它前面的自定义头」这种组合在保存成功后
+  // 仍被判定为「有未保存的修改」，保存按钮一直亮着。
+  const dirty = ready && !sameOverrides(buildOverrides(), state.overrides)
+
+  return (
+    <section className='panel'>
+      <PanelHead
+        title='Cline 伪装头'
+        tip={TIPS.clineHeaders}
+        badge={state.status === 'ready'
+          ? <StatusBadge tone='ok'>已生效</StatusBadge>
+          : state.status === 'unavailable'
+            ? <StatusBadge tone='bad'>不可用</StatusBadge>
+            : <StatusBadge tone='idle'>检测中…</StatusBadge>}
+        actions={<RefreshButton id='btn-cline-headers-refresh' onClick={() => void refreshClineHeaders()} />}
+      />
+      <div className='panel-body'>
+        <div className='retention-list'>
+          {ready
+            ? rows.map((row, index) => (
+              <div key={String(index)} className='flex items-center gap-2'>
+                <Input
+                  className='w-[190px] shrink-0 font-mono text-[13px]'
+                  value={row.key}
+                  readOnly={row.isDefault}
+                  disabled={busy}
+                  placeholder='X-Custom-Header'
+                  onChange={event => updateRow(index, { key: event.target.value })}
+                />
+                <Input
+                  className='flex-1 font-mono text-[13px]'
+                  value={row.value}
+                  disabled={busy}
+                  placeholder={row.isDefault ? '值（留空 = 不发送）' : '值'}
+                  onChange={event => updateRow(index, { value: event.target.value })}
+                />
+                <Button
+                  variant='ghost'
+                  disabled={busy}
+                  onClick={() => {
+                    if (row.isDefault) {
+                      updateRow(index, { value: state.defaults[row.key] ?? '' })
+                    } else {
+                      setRows(current => current.filter((_, i) => i !== index))
+                    }
+                  }}
+                >
+                  {row.isDefault ? '还原' : '删除'}
+                </Button>
+              </div>
+            ))
+            : null}
+          <div className='flex items-center gap-2'>
+            <Button
+              variant='outline'
+              disabled={busy || !ready}
+              onClick={() => setRows(current => [...current, { key: '', value: '', isDefault: false }])}
+            >
+              添加自定义头
+            </Button>
+            <div className='flex-1' />
+            <Button
+              variant='ghost'
+              disabled={busy || !ready || Object.keys(state.overrides).length === 0}
+              onClick={() => void saveClineHeaders({})}
+            >
+              恢复默认
+            </Button>
+            <Button disabled={busy || !ready || !dirty} onClick={() => void saveClineHeaders(buildOverrides())}>
+              保存
+            </Button>
+          </div>
+        </div>
+        <div className='settings-state'>
+          {state.status === 'loading'
+            ? STATES.appLoading
+            : state.status === 'unavailable'
+              ? '未能读取 Cline 伪装头设置，请稍后重试'
+              : dirty
+                ? '有未保存的修改'
+                : `${Object.keys(state.effective).length} 个头将随每个 Cline 请求发送`
+                  + (Object.keys(state.overrides).length > 0
+                    ? `（${Object.keys(state.overrides).length} 项被覆盖）`
+                    : '（全部为默认值）')}
+        </div>
+        <div className='hint retention-note'>{NOTES.clineHeaders}</div>
+      </div>
+    </section>
+  )
+}
+
 /* ─── 安全分类 ─────────────────────────────── */
 
 function SecurityPane({ snap }: { snap: SettingsSnapshot }) {
@@ -1149,6 +1356,41 @@ function SecurityPane({ snap }: { snap: SettingsSnapshot }) {
 
   return (
     <>
+      <section className='panel'>
+        <PanelHead
+          title='网关跨域访问（CORS）'
+          tip={TIPS.cors}
+          badge={snap.cors.status === 'ready'
+            // 极性与指纹脱敏相反：这个开关「关闭」才是不扩大暴露面的常态，
+            // 所以开着时给提醒色（bad），关着才是 ok
+            ? (snap.cors.on ? <StatusBadge tone='bad'>已开启</StatusBadge> : <StatusBadge tone='ok'>已关闭</StatusBadge>)
+            : snap.cors.status === 'unavailable'
+              ? <StatusBadge tone='bad'>不可用</StatusBadge>
+              : <StatusBadge tone='idle'>检测中…</StatusBadge>}
+          actions={<RefreshButton id='btn-cors-refresh' onClick={() => void refreshCors()} />}
+        />
+        <div className='panel-body'>
+          <div className='settings-switches'>
+            <SwitchRow
+              id='settings-cors'
+              label='允许浏览器里的页面跨来源调用网关（/v1/*）'
+              checked={snap.cors.on}
+              // 读到后端值之前不许切（同指纹脱敏：切了也不知道后端原本是什么）
+              disabled={snap.cors.status !== 'ready' || snap.busy === 'cors'}
+              onCheckedChange={next => void saveCors(next)}
+            />
+          </div>
+          <div className='settings-state'>
+            {snap.cors.status === 'loading'
+              ? STATES.appLoading
+              : snap.cors.status === 'unavailable'
+                ? STATES.corsUnavailable
+                : snap.cors.on ? STATES.corsOn : STATES.corsOff}
+          </div>
+          <div className='hint retention-note'>{NOTES.cors}</div>
+        </div>
+      </section>
+
       <section className='panel'>
         <PanelHead title='机器人校验' />
         <div className='panel-body'>
@@ -1425,6 +1667,148 @@ function RetentionConfirmDialog({ confirm }: { confirm: { head: string } | null 
   )
 }
 
+/* ─── 局域网访问的确认 / 注册弹窗 ─────────────── */
+
+/** 三种确认（开启 / 关闭 / 面板子开关）各自的标题、正文与确认键文案 */
+const LAN_CONFIRM_COPY: Record<
+  NonNullable<LanConfirm>['mode'],
+  { title: string; body: (panel: boolean) => React.ReactNode; label: string }
+> = {
+  enable: {
+    title: '开启局域网访问',
+    body: () => (
+      <>
+        为了安全，开启前需要先注册一个<b>面板管理员账号</b>（已注册过会跳过这一步，直接生效）。
+        <br />
+        开启后网关将监听所有网卡，同一局域网内的设备即可把 API 地址指向本机 IP 一起使用；管理接口从此要求
+        管理员会话或网关 Key，转发接口在没有一把启用的 Key 时也会拒绝服务（届时会自动创建一把名为「默认」的 Key）。
+        <br />
+        <strong>保存后应用将重启以生效。</strong>确定继续？
+      </>
+    ),
+    label: '继续',
+  },
+  disable: {
+    title: '关闭局域网访问',
+    body: () => (
+      <>
+        关闭后网关回到只监听 127.0.0.1，局域网内的设备将无法继续访问；已配置的网关 Key 与账号都不受影响。
+        <br />
+        <strong>保存后应用将重启以生效。</strong>确定继续？
+      </>
+    ),
+    label: '关闭并重启',
+  },
+  panel: {
+    title: '变更网页管理面板',
+    body: panel =>
+      panel ? (
+        <>
+          开放后，局域网内其他设备的浏览器打开本机 IP 即可进入管理面板（需管理员账号登录）。
+          <br />
+          <strong>保存后应用将重启以生效。</strong>确定继续？
+        </>
+      ) : (
+        <>
+          关闭后，管理界面不再从局域网提供，只有本机的桌面程序可以管理；已开启的 API 转发不受影响。
+          <br />
+          <strong>保存后应用将重启以生效。</strong>确定继续？
+        </>
+      ),
+    label: '保存并重启',
+  },
+}
+
+/**
+ * 局域网访问的两段式弹窗（骨架照 RetentionConfirmDialog）：
+ *   · 确认段（`confirm` 非空）：开 / 关 / 面板子开关各自的后果与「需重启」；
+ *   · 注册段（`register` 非空）：确认开启但还没有管理员时接着出现的表单 ——
+ *     就是确认文案里说的「注册管理员账号」那一步，注册成功由流程层直接继续
+ *     开启（`submitLanRegister`），用户不需要再点一次确认。
+ * 取消 / 右上角 ✕ / 点遮罩 / Esc 都算「不继续」：开关保持原状（受控组件自动弹回）。
+ * 注册段焦点落在取消键：表单里有未提交的输入，敲回车该走提交而不是关闭。
+ */
+function LanDialog({ confirm, register }: { confirm: LanConfirm; register: LanRegister }) {
+  const cancelRef = React.useRef<HTMLButtonElement | null>(null)
+  const nameRef = React.useRef<HTMLInputElement | null>(null)
+  const passwordRef = React.useRef<HTMLInputElement | null>(null)
+
+  const open = confirm !== null || register !== null
+  const close = () => {
+    if (register !== null) cancelLanRegister()
+    else resolveLanConfirm(false)
+  }
+  const submitRegister = () => {
+    submitLanRegister(nameRef.current?.value ?? '', passwordRef.current?.value ?? '')
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={next => { if (!next) close() }}>
+      <DialogContent className='w-[min(480px,calc(100vw-48px))]' initialFocus={cancelRef}>
+        {register !== null ? (
+          <>
+            <DialogHeader>
+              <DialogTitle>注册管理员账号</DialogTitle>
+            </DialogHeader>
+            <DialogBody>
+              <div>
+                局域网开放后，管理接口要求登录。请设置管理员账号与密码，注册完成会直接继续开启流程。
+              </div>
+              {/* 允许浏览器自带的账号密码记忆：autoComplete 与登录页同款 */}
+              <form
+                onSubmit={event => { event.preventDefault(); if (!register.busy) submitRegister() }}
+              >
+                <Label htmlFor='lan-admin-name' className='mt-3.5 mb-[5px] block text-[12.5px]'>账号</Label>
+                {/* 提交时壳侧按 ref 读值（submitLanRegister），ref 必须真的挂上 */}
+                <Input ref={nameRef} id='lan-admin-name' autoComplete='username' placeholder='管理员账号' disabled={register.busy} />
+                <Label htmlFor='lan-admin-password' className='mt-3.5 mb-[5px] block text-[12.5px]'>密码</Label>
+                <Input
+                  ref={passwordRef}
+                  id='lan-admin-password'
+                  type='password'
+                  autoComplete='new-password'
+                  placeholder='至少 8 位'
+                  disabled={register.busy}
+                />
+              </form>
+              <div className='mt-3 min-h-5 text-[13px] whitespace-pre-wrap text-destructive'>
+                {register.error}
+              </div>
+            </DialogBody>
+            <DialogFooter>
+              <div className='mr-auto' />
+              <Button ref={cancelRef} variant='outline' onClick={cancelLanRegister} disabled={register.busy}>
+                取消
+              </Button>
+              <Button onClick={submitRegister} disabled={register.busy}>
+                {register.busy ? '正在注册…' : '注册并开启'}
+              </Button>
+            </DialogFooter>
+          </>
+        ) : (
+          <>
+            <DialogHeader>
+              <DialogTitle>{confirm ? LAN_CONFIRM_COPY[confirm.mode].title : ''}</DialogTitle>
+            </DialogHeader>
+            <DialogBody>
+              <div>{confirm ? LAN_CONFIRM_COPY[confirm.mode].body(confirm.panel) : null}</div>
+            </DialogBody>
+            <DialogFooter>
+              <div className='mr-auto' />
+              <Button ref={cancelRef} variant='outline' onClick={() => resolveLanConfirm(false)}>
+                取消
+              </Button>
+              <Button onClick={() => resolveLanConfirm(true)}>
+                {confirm ? LAN_CONFIRM_COPY[confirm.mode].label : '继续'}
+              </Button>
+            </DialogFooter>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 /* ─── 页面 ─────────────────────────────────── */
 
 function SettingsPage() {
@@ -1496,6 +1880,7 @@ function SettingsPage() {
       </div>
 
       <RetentionConfirmDialog confirm={snap.retentionConfirm} />
+      <LanDialog confirm={snap.lanConfirm} register={snap.lanRegister} />
     </div>
   )
 }

@@ -15,6 +15,7 @@ import { DialogSection, InputGroup, InputGroupAddon, InputGroupInput, SegmentedC
 
 import { accountCountOf, shared } from './add-account-bridge'
 import type { CustomProviderRecord } from './add-account-bridge'
+import { WORKBUDDY_ENTRY_LABEL, WORKBUDDY_PROVIDER } from './add-account-configs'
 import { ADD_SEG_CLASS } from './add-provider-blocks'
 
 /** 第 1 步的账号类型：反代（内置八家）/ 预置 API / 自定义 / 导入 */
@@ -68,6 +69,10 @@ const PROVIDER_ICONS: Record<string, string> = {
   'zcode-intl': 'assets/providers/zcode.png',
   codearts: 'assets/providers/codearts.png',
   trae: 'assets/providers/trae.png',
+  // Loomy：取自安装包 `resources/app.asar` 的 Windows 图标集
+  // （`build/icons/favicon-228.png`，与系统里显示的应用图标为同一张；
+  // 绿色圆底上的品牌形象）
+  loomy: 'assets/providers/loomy.png',
 }
 
 type CardItem = {
@@ -108,20 +113,41 @@ function providerCards(accountType: AccountType): CardItem[] {
     }))
   }
   const list = providers?.all?.() || []
-  // 摘要还没到时先放 WorkBuddy 一张：弹窗不能因为一次状态未就绪就空着
+  // WorkBuddy 这张卡与它的弹窗标题用**中性品牌名**（不带地区）而不是注册名：
+  // 这个入口内部有「账号版本」分段，两版都从这一张卡进（名字见
+  // `WORKBUDDY_ENTRY_LABEL` 的说明）。与下面那条「国际版不进卡片列表」是同一件事
+  // 的两半：入口一处、版本在块里选。
+  const labelOf = (id: string, fallback: string): string =>
+    id === WORKBUDDY_PROVIDER
+      ? WORKBUDDY_ENTRY_LABEL
+      : shared().wbProviders?.labelOf?.(id) || fallback
+  // 摘要还没到时先放 WorkBuddy 一张：弹窗不能因为一次状态未就绪就空着。
+  // 名字与注册表无关（走上面那条中性口径）—— 兜底文案与真实文案不一致的话，
+  // 网络慢的那一次会让用户以为界面变了样。
   const cards: CardItem[] = list.length
-    ? list.map(item => ({
-      id: String(item.id || ''),
-      label: String(item.label || item.id || ''),
-      count: Number(item.count) || 0,
-    }))
-    : [{ id: 'workbuddy', label: 'WorkBuddy', count: accountCountOf('workbuddy') }]
+    ? list.map(item => {
+      const id = String(item.id || '')
+      return {
+        id,
+        label: labelOf(id, String(item.label || item.id || '')),
+        count: Number(item.count) || 0,
+      }
+    })
+    : [{ id: WORKBUDDY_PROVIDER, label: WORKBUDDY_ENTRY_LABEL, count: accountCountOf(WORKBUDDY_PROVIDER) }]
+  // WorkBuddy 国际版**不进这张卡列表**：它已经由国内版那张卡里的「账号版本」
+  // 分段覆盖（同一个 WorkBuddyBlock 的两个选项），两处入口会让用户以为要走两条
+  // 流程，而落到国际版卡片时那个块根本不会渲染（`add-account-modal` 按
+  // `provider === 'workbuddy'` 分派，症状是一张空表单）。
+  // 拆家后它是独立 provider，但**添加入口**仍然是同一个块 —— 与 AutoClaw /
+  // Accio / ZCode 那三家（各自一块、没有地区分段）的形态不同，这是刻意的：
+  // WorkBuddy 两地的登录页与凭证形态完全一致，合成一块对用户更省事。
+  const visible = cards.filter(item => item.id !== 'workbuddy-intl')
   // 展示顺序微调：两个 AutoClaw 版本要挨着（两列网格里同处一行）且**国内版在前**
   // —— 摘要给的是注册表顺序，把 Qoder 挪到国内版前面即可
-  const from = cards.findIndex(item => item.id === 'qoder')
-  const to = cards.findIndex(item => item.id === 'autoclaw')
-  if (to >= 0 && from > to) cards.splice(to, 0, cards.splice(from, 1)[0])
-  return cards
+  const from = visible.findIndex(item => item.id === 'qoder')
+  const to = visible.findIndex(item => item.id === 'autoclaw')
+  if (to >= 0 && from > to) visible.splice(to, 0, visible.splice(from, 1)[0])
+  return visible
 }
 
 /** 卡片图标：收录过的家出真实图标（预置家问预置目录要），其余用首字母徽章 */

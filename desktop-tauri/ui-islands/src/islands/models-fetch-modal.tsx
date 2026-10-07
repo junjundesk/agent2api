@@ -65,6 +65,7 @@ import {
 /** 账号公开形态里本弹窗用到的字段（其余不关心） */
 type Account = {
   id?: unknown; provider?: string; name?: string; nickname?: string; email?: string
+  nameCustom?: boolean
   available?: boolean; enabled?: boolean
 }
 
@@ -237,10 +238,11 @@ function managedIds(providerId: string): Set<string> {
   return new Set((Array.isArray(models) ? models : []).map(model => norm(model?.id)).filter(Boolean))
 }
 
-/** 账号的展示名：与账号页的主名口径同源 —— 以邮箱报名字的家（Qoder / AutoClaw 国际版，见
- *  accounts-groups 的 emailAsName）直接用邮箱，其余取昵称 / 名称 / 邮箱 / id；缺邮箱时
- *  emailAsName 的家回落名字。 */
+/** 账号的展示名：与账号页同一分流（displayNameOf）—— 设过备注（nameCustom）
+ *  恒用备注名；未打标维持旧口径：以邮箱报名字的家（Qoder / AutoClaw 国际版 /
+ *  Accio）直接用邮箱，其余取昵称 / 名称 / 邮箱 / id。 */
 function accountLabel(account: Account): string {
+  if (account?.nameCustom === true && account?.name) return account.name
   const email = String(account?.email || '').trim()
   if (shared().wbAccountsModel?.providerFeatures?.(account?.provider)?.emailAsName && email) return email
   const name = String(account?.nickname || account?.name || email || account?.id || '').trim()

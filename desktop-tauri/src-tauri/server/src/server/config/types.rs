@@ -87,6 +87,38 @@ pub const KEY_DEBUG_MODE: &str = "debugMode";
 /// 转发层逐请求读快照，改完下一个请求立即生效，不重启进程。
 pub const KEY_SANITIZE_FINGERPRINTS: &str = "sanitizeBlacklistFingerprints";
 
+/// **Cline 转发头的逐键覆盖**（config.json 键）。
+///
+/// 形状：`{"User-Agent": "Cline/3.0.62", ...}`（string → string）。语义是
+/// **覆盖表**而非全量配置：Cline 上游请求的伪装头默认值硬编码在
+/// `core::providers::cline::headers`（与官方客户端形态对齐的那一套，含
+/// `X-CLIENT-TYPE: cline-sdk` 这类产品面校验头），这张表里**非空**的项按键
+/// 覆盖默认值（也可新增自定义头），**空串**的项表示「这个头不要发」——
+/// 于是「回到默认」与「删掉某个头」都是一次 PUT 就能表达的事。
+///
+/// 为什么默认值不进配置：与 `promptGatewayText` 同一取向 —— 默认值是代码里
+/// 的一等公民（上游行为收紧时跟着版本走），配置里只存用户**改过的**那部分，
+/// 存量安装不迁移、不回种。
+pub const KEY_CLINE_UPSTREAM_HEADERS: &str = "clineUpstreamHeaders";
+
+/// 网关面（`/v1/*`）跨域访问开关的键（config.json 键，设置页「安全 → 网关跨域访问」）。
+///
+/// **默认关闭**：不开时浏览器里第三方来源的页面调不到网关面 —— 预检请求会落到
+/// API Key 中间件上被 401 拒掉（预检按规范不携带 `Authorization` 头），页面侧
+/// 只能看到一句「无法连接 API」。要用浏览器里的本地页面（自建 Web UI、单文件
+/// 前端应用等）直接连网关时把它打开。开启后网关面按面板路由的老口径应答：
+/// 预检直接 204，三个 `Access-Control-Allow-*` 头逐响应下发（来源为 `*`）。
+///
+/// ── 为什么默认关，而面板路由一直是 `*` ────────────────────────
+/// 面板路由的 `*` 是既有行为（面板与 `/api/*` 同源，浏览器本来不需要它），
+/// 改它属于另一件事；而网关面是**真正转发上游、消耗额度**的那一面 ——
+/// 开着 `*` 又没配 API Key 时，任何网页都能借本机网关打上游。默认关 + 显式
+/// 开启，至少让用户知道自己打开了什么。
+///
+/// 面板路由（`/api/*`）不受本开关影响，保持既有的无条件 CORS
+/// （见 `http::panel_router` 与 `http::cors`）。
+pub const KEY_CORS_ENABLED: &str = "corsEnabled";
+
 /// 机器人校验开关的键（config.json 键，ALTCHA proof-of-work，见 `server::altcha`）。
 ///
 /// **默认开启**：登录 / 注册是公开的认证边界，脚本可以无限打（暴破密码、

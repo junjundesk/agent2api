@@ -17,7 +17,6 @@ use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store_util::{token_tail_of, truncate_text};
 use crate::server::core::account_store::MAX_TOKEN_LENGTH;
 use crate::server::core::endpoints::resolve_edition;
-use crate::server::core::providers::{kind_id, ProviderKind};
 
 /// 导入值不允许覆盖的键（本机运营字段；语义见模块头）。
 const LOCAL_OWNED_KEYS: [&str; 6] = [
@@ -172,7 +171,10 @@ pub(super) fn normalize_imported(
         record.insert("proxy".to_string(), Value::Null);
     }
 
-    if provider == kind_id(ProviderKind::WorkBuddy) {
+    // 判据是「workbuddy 系」而不是单个 id：国内版与国际版共用同一套账号 schema
+    // （uid 身份 + edition/endpoint/prefixPath/platform），写成单 id 会让国际版
+    // 掉进 else 分支把那些字段**清掉** —— 导入后账号只剩默认端点，转发必然 401。
+    if crate::server::core::providers::workbuddy::is_workbuddy_family(&provider) {
         normalize_workbuddy_known_fields(&mut record, item, before);
     } else {
         // 非 WorkBuddy：edition / prefixPath / endpoint / platform 是 WorkBuddy 的
@@ -193,21 +195,40 @@ pub(super) fn normalize_imported(
     Ok(record)
 }
 
-/// 自定义提供商账号的专属字段：apiKey（凭证）、baseUrl（账号级覆盖项）、
-/// tokenTail（界面尾号）。
+/// 自定义提供商账号的专属字段：apiKey（凭证）、noAuth（无需鉴权标记）、
+/// baseUrl（账号级覆盖项）、tokenTail（界面尾号）。
 ///
-/// 三者都是 `custom_accounts::add_custom_account` 落盘的形状，导入沿用同一套
+/// 四者都是 `custom_accounts::add_custom_account` 落盘的形状，导入沿用同一套
 /// 规则：apiKey trim 后落盘（超长该条失败）、导入值为空时保留本机旧凭证
 /// （与 accessToken / refreshToken 的合并纪律一致）；baseUrl 带键才动 ——
 /// 空值清除覆盖项（回落提供商默认基址），非空值过 `normalize_base_url` 门禁；
 /// tokenTail 显式值优先，否则按最终 apiKey 重新派生（尾号必须与凭证同源，
 /// 用旧尾号配新 key 会让界面展示对不上号）。
+///
+/// ── noAuth 与 apiKey 的互斥在这里也要守 ─────────────────────
+/// 与写入侧（`add_custom_account` / `update_custom_credentials`）同一条不变量：
+/// 勾着「无需鉴权」的记录不该同时挂着一把 key。判据**先算 noAuth 再算 apiKey** ——
+/// 顺序反了会让导入文件里的一把旧 key 把一个无鉴权账号复活成「有凭证」形态，
+/// 而导出侧写出的本来就只会是两者之一。
 fn normalize_custom_known_fields(
     record: &mut Map<String, Value>,
     item: &Map<String, Value>,
     before: Option<&StoredAccount>,
 ) -> Result<(), String> {
-    let api_key = {
+    // 文件显式给了就按文件（true / false 都是明确意图），没给则沿用本机标记
+    // （record 已从本机记录铺底，见 normalize_imported 的说明）
+    let no_auth = match item.get("noAuth") {
+        Some(Value::Bool(flag)) => *flag,
+        _ => matches!(record.get("noAuth"), Some(Value::Bool(true))),
+    };
+    if no_auth {
+        record.insert("noAuth".to_string(), Value::Bool(true));
+    } else {
+        record.remove("noAuth");
+    }
+    let api_key = if no_auth {
+        String::new()
+    } else {
         let incoming = text_of(item.get("apiKey"));
         if incoming.is_empty() {
             before
@@ -224,7 +245,10 @@ fn normalize_custom_known_fields(
     }
     record.insert("apiKey".to_string(), Value::String(api_key.clone()));
 
-    let token_tail = {
+    let token_tail = if no_auth {
+        // 无需鉴权的账号没有尾号可展示（与 `add_custom_account` 同一形态）
+        String::new()
+    } else {
         let incoming = text_of(item.get("tokenTail"));
         if !incoming.is_empty() {
             incoming

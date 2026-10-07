@@ -36,7 +36,7 @@ use serde_json::{Map, Value};
 
 use crate::server::core::account_store::priority::next_free_priority;
 use crate::server::core::account_store::sql;
-use crate::server::core::account_store::state::StoredAccount;
+use crate::server::core::account_store::state::{mark_name_custom, StoredAccount};
 use crate::server::core::account_store::store::live_desktop_credentials;
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{
@@ -176,6 +176,7 @@ impl AccountStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| truncate_chars(value, 100));
+        let explicit = explicit_name.is_some();
         let record_name = explicit_name
             .or_else(|| {
                 existing
@@ -217,6 +218,7 @@ impl AccountStore {
         record.insert("id".to_string(), Value::String(id.clone()));
         record.insert("provider".to_string(), Value::String(raccoon_id().to_string()));
         record.insert("name".to_string(), Value::String(record_name.clone()));
+        mark_name_custom(&mut record, explicit, existing.as_ref());
         record.insert("userId".to_string(), Value::String(user_id.clone()));
         record.insert("accessToken".to_string(), Value::String(token.clone()));
         record.insert(

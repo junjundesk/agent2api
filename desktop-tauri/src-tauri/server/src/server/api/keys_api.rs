@@ -15,9 +15,11 @@
 //! 两个白名单数组随记录读写，**空数组 = 不限制**（语义与字段说明见
 //! `core::api_keys` 的模块头）。列表响应额外带两个候选表，让界面**不必维护
 //! 第二份事实**：
-//!   · `providers`（注册表摘要）—— 「可用提供商」多选的候选项。项目里明确禁止
-//!     维护第二份 provider 清单（见 `account_store` 模块头那段），前端不该烤一份
-//!     写死的 id 列表；
+//!   · `providers`（注册表摘要 + 已建的自定义家，形状同为 `{id,label,count}`）——
+//!     「可用提供商」多选的候选项。这张表由后端拼整：内置家在注册表里，自定义家
+//!     是运行期数据、前端自己凑要另拉一次 `/api/custom-providers` 并对时序（见
+//!     `list_json`）。项目里明确禁止维护第二份 provider 清单（见 `account_store`
+//!     模块头那段），前端不该烤一份写死的 id 列表；
 //!   · `modelsByProvider`（每家 → 对外名清单）—— 「可用模型」多选的候选项。
 //!     界面按用户当前勾了哪几家取并集（一家没勾就是空，见 `keys-panel.js`）。
 //!     这张表必须由后端给：模型名是各家清单 + 映射别名的合并结果，前端拿不到
@@ -25,10 +27,10 @@
 //!     按家过滤它会漏掉被别家认领的同名模型（论证见
 //!     `catalog::models_by_provider` 的说明）。
 //!
-//! 写入侧在这一层做校验（`providers::is_known_provider_id` 判 id 认不认识、
-//! 元素必须是字符串），读取侧则一律宽容（理由见 `core::api_keys` 的模块头那条
-//! 硬不变量：升级绝不能让已有 Key 失效）。校验放在写入侧而不是 core：core 是
-//! 「存取 + 判定」，把「哪些值算合法」集中在一处入口更好改。
+//! 写入侧在这一层做校验（`is_allowed_provider_id` 判 id 认不认识、元素必须是
+//! 字符串），读取侧则一律宽容（理由见 `core::api_keys` 的模块头那条硬不变量：
+//! 升级绝不能让已有 Key 失效）。校验放在写入侧而不是 core：core 是「存取 + 判定」，
+//! 把「哪些值算合法」集中在一处入口更好改。
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -44,19 +46,29 @@ use crate::server::ServerState;
 
 fn list_json(state: &ServerState) -> Value {
     let keys: Vec<Value> = api_keys::list().iter().map(api_keys::ApiKeyEntry::public_json).collect();
-    // 可用提供商多选的候选：**注册表**（唯一事实来源，加一家 provider 时这里
-    // 自动多一项，前端零改动）。带上 count 让界面能显示「这家有几个账号」——
+    // 可用提供商多选的候选：**注册表 + 已建的自定义家**（加一家内置 provider 时
+    // 这里自动多一项，前端零改动）。带上 count 让界面能显示「这家有几个账号」——
     // 用户在这里勾「允许哪几家」时，那几家有没有账号是他最需要知道的信息。
     //
+    // 自定义家必须在这一层并进来：它是运行期数据（kv 配置里，`custom-` 前缀），
+    // 注册表里没有它，而「可用模型」那半边（`modelsByProvider`，见
+    // `catalog::models_by_provider`）本来就把自定义家算在内 —— 只并模型不并这家
+    // 会让同一响应里的两张候选表自相矛盾（能勾到自定义家的模型，却勾不到它本身）。
+    // 让前端自己并也不行：它得另拉一次 `/api/custom-providers` 再处理两份数据的
+    // 时序，而注册表那半它本来就拿不到（见模块头「不必维护第二份事实」）。
+    //
     // 计数取自账号快照（一次读盘，与 `/api/session` 的 providers 摘要同源口径）；
-    // 这里只为展示，不做任何判定，所以直接按 provider 字段数一遍即可。
+    // 这里只为展示，不做任何判定，所以直接按 provider 字段数一遍即可。两张表共用
+    // 同一个闭包，所以自定义家与内置家的 count 是同一口径。
     let accounts = crate::server::core::routing::accounts_of(&state.store().list_accounts());
-    let providers = crate::server::core::providers::summary_json(|id| {
+    let count_accounts = |id: &str| {
         accounts
             .iter()
             .filter(|account| crate::server::core::routing::provider_of(account).eq_ignore_ascii_case(id))
             .count()
-    });
+    };
+    let mut providers = crate::server::core::providers::summary_json(&count_accounts);
+    providers.extend(crate::server::core::custom_providers::summary_json(&count_accounts));
     json!({
         "keys": keys,
         "authRequired": config::current().api_key_set(),
@@ -67,6 +79,25 @@ fn list_json(state: &ServerState) -> Value {
         // 也避免了「响应回来时用户已经改了勾选」的竞态。
         "modelsByProvider": crate::server::core::providers::catalog::models_by_provider(&state.store()),
     })
+}
+
+/// 「可用提供商」白名单里的一个 id 算不算数。
+///
+/// 两条路都算：内置家（注册表判据 `providers::is_known_provider_id`）与**当前真实
+/// 存在**的自定义家（`custom-` 前缀且存储里有记录，判据见
+/// `custom_providers::is_custom_provider_id`）。
+///
+/// 自定义家曾经在候选表里缺席、在写入校验里被拒：界面选不到、手写也会被
+/// 400 挡回，而运行期的限制判定（`key_scope::allows_provider`）本来只把 provider id
+/// 当字符串比（小写、忽略首尾空白）—— 校验比执行更严，用户看到的就是「自定义家
+/// 不能拿来限定 Key」。
+///
+/// 为什么不放宽成「凡 `custom-` 前缀一律放行」：前缀对不上存储记录的是手改数据塞
+/// 进来的死 id（没有协议与基址，转发必然失败），认它等于让一把 Key 的可用范围里
+/// 躺着一个永远不可用的家 —— 那正是 `is_custom_provider_id` 要挡的东西。
+fn is_allowed_provider_id(id: &str) -> bool {
+    crate::server::core::providers::is_known_provider_id(id)
+        || crate::server::core::custom_providers::is_custom_provider_id(id)
 }
 
 /// 从请求体里读一个白名单数组（`None` = 请求体里没这个键 = **不动**）。
@@ -101,7 +132,7 @@ fn parse_allowlist(
         if text.is_empty() {
             continue;
         }
-        if check_provider && !crate::server::core::providers::is_known_provider_id(text) {
+        if check_provider && !is_allowed_provider_id(text) {
             return Err(errors::management_error(400, format!("未知的提供商: {text}")));
         }
         if out.iter().any(|known: &String| known.eq_ignore_ascii_case(text)) {
@@ -118,6 +149,35 @@ fn body_object(body: &Bytes) -> Result<serde_json::Map<String, Value>, Response>
         .as_object()
         .cloned()
         .ok_or_else(|| errors::management_error(400, "请求体必须是 JSON 对象"))
+}
+
+/// 面板管理员已注册时，拒绝让「最后一把启用的 Key」消失（删除或停用）。
+///
+/// 管理员一注册，`/api/*` 就要求会话或 Key 认证（`require_api_key` 的
+/// panel_auth 分支），而桌面壳的管理请求靠自动携带第一把启用的 Key 通过
+/// 这道认证 —— 一把启用的都不剩时，壳会被自己的闸门挡在管理 API 外面，
+/// 界面整体不可用且无法自救（建 Key 也要先过闸门；headless 的网页面板
+/// 可以靠登录会话自救，桌面壳没有会话通道）。这是注册后世界里的保护性
+/// 约束：先建新的、再动旧的。注册前的免鉴权模式不受影响。
+fn guard_last_active_key(entries: &[api_keys::ApiKeyEntry], target_id: &str, action: &str) -> Result<(), Response> {
+    if !crate::server::access::panel_auth_enabled() {
+        return Ok(());
+    }
+    let Some(target) = entries.iter().find(|entry| entry.id == target_id) else {
+        return Ok(()); // 不存在的 id 交给原有的 404 路径
+    };
+    if !target.enabled {
+        return Ok(()); // 动的是已停用的 Key，启用数不会变
+    }
+    if entries.iter().filter(|entry| entry.enabled).count() > 1 {
+        return Ok(());
+    }
+    Err(errors::management_error(
+        400,
+        format!(
+            "面板管理员已注册，至少要保留一把启用的网关 Key（桌面端管理界面靠它访问）：请先创建新的 Key，再{action}这一把"
+        ),
+    ))
 }
 
 /// GET /api/keys
@@ -174,6 +234,12 @@ pub async fn update_key(State(state): State<ServerState>, Path(id): Path<String>
         Ok(value) => value,
         Err(response) => return response,
     };
+    if let Some(false) = enabled {
+        // 停用受与删除同一道约束：它同样会让「启用的 Key」归零
+        if let Err(response) = guard_last_active_key(&api_keys::list(), &id, "停用") {
+            return response;
+        }
+    }
     match api_keys::update(&id, name, enabled, allowed_providers, allowed_models) {
         Ok(entry) => {
             logging::log(
@@ -188,6 +254,9 @@ pub async fn update_key(State(state): State<ServerState>, Path(id): Path<String>
 
 /// DELETE /api/keys/{id}
 pub async fn delete_key(State(state): State<ServerState>, Path(id): Path<String>) -> Response {
+    if let Err(response) = guard_last_active_key(&api_keys::list(), &id, "删除") {
+        return response;
+    }
     match api_keys::remove(&id) {
         Ok(()) => {
             let remaining = config::current().api_key_set();

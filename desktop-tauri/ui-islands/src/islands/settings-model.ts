@@ -19,7 +19,14 @@
 /* ─── 桥与共享全局 ─────────────────────────── */
 
 /** 启动与托盘设置（壳命令 get_app_settings / save_app_settings） */
-export type AppSettings = { closeToTray: boolean; autostart: boolean }
+export type AppSettings = {
+  closeToTray: boolean
+  autostart: boolean
+  /** 局域网访问：监听 0.0.0.0（改动随「应用重启」生效，见 TIPS.lan） */
+  lanAccess: boolean
+  /** 局域网访问开启时是否同时托管网页管理面板（同样随重启生效） */
+  lanPanel: boolean
+}
 
 /** 导入失败项：customProvider 标记的那条不是账号，是自定义提供商定义 */
 export type ImportError = { id?: string; message?: string; customProvider?: boolean }
@@ -88,6 +95,16 @@ export type PromptPatch = {
   clearDegrade?: boolean
 }
 
+/** Cline 伪装头接口的响应（GET 与 PUT 同形，键与后端 api/cline_headers.rs 一致） */
+export type ClineHeadersData = {
+  /** 用户改过的键（原样回显；空值 = 这个头不发送） */
+  overrides: Record<string, string>
+  /** 默认值（代码里内置的那一套；界面据此判断「改回了默认」） */
+  defaults: Record<string, string>
+  /** 默认值 ∪ 覆盖合并后的生效值（适配器实际会发的那份） */
+  effective: Record<string, string>
+}
+
 /** 本页用到的壳 / HTTP 桥（方法名与 bridge.rs 一一对应，一个都不能改） */
 export type SettingsBridge = {
   /** 'desktop' | 'web'：面板登录那一块只在网页端有意义 */
@@ -108,12 +125,27 @@ export type SettingsBridge = {
   saveDebug(enabled: boolean): Promise<unknown>
   getSanitize(): Promise<unknown>
   saveSanitize(enabled: boolean): Promise<unknown>
+  getClineHeaders(): Promise<unknown>
+  saveClineHeaders(overrides: Record<string, string>): Promise<unknown>
+  getCors(): Promise<unknown>
+  saveCors(enabled: boolean): Promise<unknown>
   getPrompt(): Promise<unknown>
   savePrompt(payload: PromptPatch): Promise<unknown>
   getStorage(): Promise<unknown>
   getCaptchaSetting(): Promise<{ captchaEnabled?: boolean } | null | undefined>
   saveCaptchaSetting(on: boolean): Promise<{ captchaEnabled?: boolean } | null | undefined>
   panelLogout(): Promise<unknown>
+  /** 后端就绪状态（局域网地址展示要拼网关端口；其余字段本页不消费） */
+  getBackendStatus?(): Promise<{ port?: number } | null | undefined>
+  // ── 局域网访问（仅桌面端渲染，web 端 shim 不提供这几个方法）──
+  /** 面板管理员是否已注册（开启流程据此决定要不要先走注册步） */
+  panelAdminStatus?(): Promise<{ registered?: boolean } | null | undefined>
+  /** 注册面板管理员（受信本地路径，不走公开的 HTTP 注册端点） */
+  panelRegister?(username: string, password: string): Promise<{ registered?: boolean; existed?: boolean }>
+  /** 切换局域网访问（写设置并重启应用）；返回里的 createdKey 非空 = 已自动补了首把 Key */
+  changeLanAccess?(enabled: boolean, panel: boolean): Promise<unknown>
+  /** 本机在局域网里的地址（查不到为 null） */
+  localIp?(): Promise<string | null | undefined>
   /** 打开外链的唯一出口（只放行 http(s)）：桌面走系统浏览器，网页端 shim 是 window.open */
   openReleasePage?(url: string): Promise<unknown>
 }
@@ -489,6 +521,8 @@ export function normalizeApp(saved: unknown, fallback: AppSettings): AppSettings
     const record = saved as Record<string, unknown>
     if (typeof record.closeToTray === 'boolean') result.closeToTray = record.closeToTray
     if (typeof record.autostart === 'boolean') result.autostart = record.autostart
+    if (typeof record.lanAccess === 'boolean') result.lanAccess = record.lanAccess
+    if (typeof record.lanPanel === 'boolean') result.lanPanel = record.lanPanel
   }
   return result
 }
@@ -547,11 +581,14 @@ export const TIPS = {
   displayZoom: '等比放大或缩小整个界面（文字、控件、间距一起变），效果与浏览器按 Ctrl +/- 相同：80%–130%、5% 一档。窗口本身不缩放，变的是页面内容的显示比例，设置立即生效并记住，下次启动直接按这个比例打开。放得越大可视范围越小，窗口较窄或表格较宽时不建议调得太大。',
   displayLanguage: '界面语言。目前只提供简体中文，所以这里只有这一项可选（选中即当前语言）。以后增加其它语言时，这个列表里会出现对应选项，选择后立即应用到界面。',
   tray: '默认关闭窗口不会退出程序，而是把窗口缩到系统托盘，转发继续在后台运行（OpenAI 客户端不受影响）；要彻底退出程序，请在托盘图标上右键选「退出」。关掉这个开关后，点关闭按钮即退出程序、转发随之中断。「开机自动启动」开启后，登录系统时会自动启动本程序（通常直接驻留托盘），不需要手动打开。',
+  lan: '默认网关只监听 127.0.0.1，只有本机能访问。开启后网关改听所有网卡，同一局域网内的设备可以把 API 地址指向本机 IP 一起使用。出于安全考虑，开启前必须先注册一个面板管理员：管理接口从此要求管理员会话或网关 Key，模型额度不会对局域网裸奔；一把启用的网关 Key 都没有时，转发接口也会拒绝服务，直到创建第一把。改动需要重启应用生效。「同时开放网页管理面板」把管理界面也出给局域网（其他设备的浏览器打开本机 IP 即可管理），默认关闭 —— 桌面端的面板仍只由本程序自己出。',
   units: '控制报表与请求日志里 Token 读数的写法：开启后按中文量级显示（1.2亿 / 8400万），关闭则用 k / M 缩写（与上游文档、接口字段的写法一致）。这只影响显示口径，不改变任何统计与存储的数值。',
   queue: '只对「排队制」的上游生效（目前是 Qoder 的免费模型）：模型繁忙时上游不报错，只回一句「建议 N 秒后再来」（业务码 10605），网关按建议时长等一会儿再发同一请求，等满次数仍排不上才把「排队中」作为错误返回（HTTP 503，文案会说明这不是登录态或额度问题）。等待发生在首个字节之前，吃的是「等待响应超时」那份预算 —— 两项设置一起决定一次请求最多卡多久；排队不会标记账号限额、也不会换账号（换谁都一样在排队）。保存后对下一个请求立即生效，不用重启。',
   timeouts: '上游请求四个阶段各自的等待上限（秒，1~3600）：①「连接中超时」= 建立 TCP/TLS 连接或代理隧道的最大等待，默认 30 秒；②「等待响应超时」= 请求发出后等上游响应头的最大时间，默认 300 秒 —— 网关请求上游恒带 stream，响应头在 SSE 建立时就到达，与模型思考多久无关；③「流式响应空闲超时」= 流式响应相邻两块数据之间允许的最大空闲，收到新数据即重新计时，默认 300 秒 —— 上游长时间不吐数据即判定连接僵死并断开；④「非流式响应超时」= 读完整份非流式响应体的总预算（一次性计时、不重置），默认 300 秒。四项都是「等待上限」，只要数据还在来，正常的流式回答就一直往下传。保存后对下一个请求立即生效，不用重启。',
   retry: '请求转发到上游失败时（服务器瞬时错误、连接失败，以及 WorkBuddy 的 11-128 敏感词拦截），网关会等一段间隔后再发一次。次数分两档，管的是两件事：①「同一账号重试次数」在同一账号上原地重发几次 —— 一般是提示词被上游拦截、或链路瞬时抖动，等一会儿重发往往就好了；②「切换账号重试次数」这份请求最多再换几个账号试 —— 首发的那个账号不算，每换一个扣一次，不分是不是同一家（换到同一家的下一个账号也算一次），换满还失败就把错误返回给客户端。两项都设为 0 表示失败不重试、直接报错。注意账号级限额（429）不占这里的换号次数 —— 那类失败走「冷却该账号并换下一个账号」的降级，与这里的重试是两条路。另有「指定错误码直接换号」名单（默认 402）：命中名单的上游状态码不在同一账号重发，直接按队列换下一个账号继续试（换号也占「切换账号重试次数」），换满仍失败才把错误返回给客户端。',
   sanitize: '上游用「逐字精确匹配」的方式审核请求体（不是语义审核）：客户端注入的固定模板句、计费头字段名、以及某些裸错误码出现在报文里就会整单拦截，返回 400。开启本项后，网关在每次转发前改写这些指纹 —— 表头键值整段删除，承载语义的模板句只换一个词（如 official CLI for Claude → official CLI tool for Claude），对话内容与语义都不受影响。规则集是内置的，不需要也无法维护词表。关掉本项后客户端模板会原样发往上游，可能重新出现模板句被误拦的报错。',
+  clineHeaders: 'Cline 上游按请求头判定「调用方是不是 Cline 自家产品」：X-CLIENT-TYPE: cline-sdk 是硬门槛（缺了它免费池模型一律 403），版本号与平台标识让请求更贴近官方客户端的形态。这里列出的是网关默认会发的头：改某一行的值 = 覆盖默认值（也可以新增默认清单之外的自定义头）；把值清空保存 = 这个头不发送；在界面删掉被改过的行 = 回落默认值。改完点「保存」，下一个 Cline 请求立即生效。不懂某一行的含义就不要动它 —— 伪装头的价值在「与官方客户端逐字一致」。',
+  cors: '网关面（/v1/*）默认不应答浏览器跨源请求：页面直连会被预检拦下，只报「无法连接 API」。注意来源是 * —— 未配「网关 Key」时任何网页都能借本机网关打上游，故默认关闭；只给自己用的话，让页面与网关同源（本地反代 /v1）更稳妥。面板接口（/api/*）不受影响。',
   prompt: '客户端（Claude Code / Codex 等 CLI）会在 system 提示词里注入几十句固定模板，上游按逐字匹配审核，命中就整单拦截（HTTP 400）。指纹脱敏能改写实测命中过的那几句，但换一个客户端版本就可能冒出新的。这里可以把 system 整段换成网关自己那份：①「透传」= 不动客户端 system（默认，行为与之前完全一致）；②「替换」= 删掉客户端所有 system / developer 消息，换成网关的提示词（客户端项目规范随之消失）；③「追加」= 在开头连续 system 块之后插入一条网关提示词，既有消息逐字不动（客户端规范与网关提示词并用）。那份提示词有两个来源：提示词文件（留空用内置默认），或直接在界面上编辑正文 —— 编辑过就以那份正文为准（优先于文件），清空则回到文件 / 内置默认。另外，透传 / 追加模式下撞了内容拦截（多半是指纹误报）时，网关会自动换一段最小中性提示词重试一次，并把「降级期」开到次日 00:00 —— 期间所有请求直接带中性提示词出门，不再先撞一次 400；这里能看见并提前解除它。上面几项是**默认值**：想给某个提供商单独配，用下面的「按提供商」加一行（带「网关自带」的家默认就列在那里）—— 不同的上游对这些内容的接受程度不一样。',
   debug: '开启后，网关会把每次转发**发给上游的请求**（请求头 + 请求体）与**上游返回的响应**（状态码 + 响应头 + 响应体）完整保存到本地，供请求日志页的「详情」查看。请求头里的 Authorization、Cookie、API Key 等凭据字段一律替换成 [redacted]，不会明文落盘；请求体与响应体按原样保存（可能包含你的对话内容）。报文只保留最近 500 条，超出后丢弃最旧的。这是排障用的临时开关，不需要时建议关闭。',
   io: '导出会把全部账号与自定义提供商定义写入一个 JSON 文件，可以拷到另一台机器上导入后继续使用。导入采用合并策略：同提供商下按业务身份（UID / userId / apiKey 等）去重 —— 已存在的账号只更新凭证，保留本机原有的优先级顺序；新账号追加到转发顺序末尾，不会抢占当前正在使用的账号；自定义提供商定义按 id 合并，本机缺失时自动补建。',
@@ -566,6 +603,8 @@ export const NOTES = {
   retry: '保存后立即生效，不用重启；次数用尽仍失败时，错误原样返回给客户端。',
   retryCodes: '命中这些上游状态码的失败不在同一账号重发，直接换下一个账号继续试（换号占用「切换账号重试次数」，换满仍失败才把错误原样返回给客户端）。输入 100–599 的状态码后回车添加，点 × 或退格删除；默认 402（积分不足）。清空全部表示任何错误都照常重试。',
   sanitize: '默认开启。命中明细会记进请求日志的「敏」标签（悬停可看命中了哪几条规则）。本项只改发给上游的副本，客户端看到的响应内容不变。',
+  clineHeaders: '值与默认值相同的行不占覆盖（存的是「改过的键」，不是全量配置）；值留空保存表示这个头不发送，删除改过的行表示回落默认值。改完立即生效，不用重启。',
+  cors: '默认关闭。改动立即生效，不用重启；关闭期间的跨源请求会被预检拦下。',
   debug: '开启后新发生的请求才会被记录（已经过去的请求补不回来）。报文统一存放在本地数据库里，只保留最近 500 条（超出后丢弃最旧的），条数见左侧「数据 → 数据存储」的「调试报文」。',
   promptMode: '替换 = 客户端 system / developer 消息全部删掉，换成网关的提示词；追加 = 保留客户端内容，只在开头 system 块之后多插一条。两者都只改发给上游的副本，客户端看到的响应不变。',
   promptFile: 'UTF-8 文本文件路径，留空用内置默认提示词（通用编码助手提示词，不含任何会被上游拦截的模板句）。只在「替换 / 追加」模式下生效，透传模式不读它。',
@@ -596,6 +635,9 @@ export const STATES = {
   sanitizeUnavailable: '未能读取指纹脱敏设置，请稍后重试',
   sanitizeOn: '正在剥离出站请求里的审核指纹：表头键值整段删除，模板句最小改写。',
   sanitizeOff: '未开启，客户端 system 模板会原样发往上游，可能被内容审核误拦（400）。',
+  corsUnavailable: '未能读取网关跨域访问设置，请稍后重试',
+  corsOn: '正在应答跨源请求：浏览器跨域请求可直连 /v1/*。',
+  corsOff: '未开启，浏览器跨域无法直连网关。',
   promptUnavailable: '未能读取系统提示词设置，请稍后重试',
   degradeUntilFallback: '次日 00:00',
   // ── 显示分类（本次新增：不来自静态骨架，是新写的文案）──

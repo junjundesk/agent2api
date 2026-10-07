@@ -125,7 +125,7 @@ function DocsPage() {
           <code>{'Authorization: Bearer <key>'}</code>
           {' 或 '}
           <code>{'x-api-key: <key>'}</code>
-          {'。一把启用的 Key 都没有时不鉴权（网关只监听 127.0.0.1）。'}
+          {'。一把启用的 Key 都没有时不鉴权（默认网关只监听 127.0.0.1；在设置页开启「局域网访问」后监听所有网卡，鉴权与安全闸门随之启用）。'}
         </span>
       </div>
     </section>

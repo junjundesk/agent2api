@@ -31,6 +31,10 @@ import {
   Button,
   DialogSection,
   Input,
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupInput,
   SegmentedControl,
   Switch,
   Textarea,
@@ -364,6 +368,16 @@ function WebLoginSection({
 
 /* ─── 手机验证码登录（sms-login.js）─────────────── */
 
+/**
+ * 表单三行收完（排法见 ui/css/page-accounts-providers.css 的 .sms-form 一段）：
+ *
+ *   手机号 *   [ 11 位大陆手机号        | 获取验证码 ]   ← 发码按钮内嵌在输入框里
+ *   验证码 *   [ 6 位数字 ]  备注名 [ 可选，留空则用脱敏手机号 ]
+ *              [登录并添加]  提示…
+ *
+ * 六个 id 与旧实现逐字一致（引擎 create() 时按 id 绑 click、之后按 id 现读
+ * .value 与写按钮文案 / 禁用态），换掉的只是外面那层布局 —— 这条契约不能动。
+ */
 function SmsSection({
   config,
   visible,
@@ -391,41 +405,62 @@ function SmsSection({
         html={sms.noteHtml}
         text={'用 AutoClaw 账号绑定的手机号登录：点击「获取验证码」，收到短信后填入下方并登录。验证码由本机直接提交给官方接口，界面不显示 token。'}
       />
-      <div className='field-row'>
-        <label htmlFor={`${prefix}-sms-phone`}>手机号（必填）</label>
-        <Input
-          id={`${prefix}-sms-phone`}
-          type='text'
-          maxLength={11}
-          placeholder='11 位大陆手机号'
-          {...draftProps(`${prefix}-sms-phone`)}
-        />
-        {/* 引擎在 create() 时就绑上这一颗的 click（文案与禁用态也归它管） */}
-        <Button id={`${prefix}-sms-send`} variant='outline'>获取验证码</Button>
-      </div>
-      <div className='field-row'>
-        <label htmlFor={`${prefix}-sms-code`}>验证码（必填）</label>
-        {/* 验证码**不进草稿**：引擎在登录成功后会把它清掉（codeNode.value = ''），
-            草稿若留着，下次挂载会把这个已经用过的码填回去 —— 手机号与备注名照旧留 */}
-        <Input
-          id={`${prefix}-sms-code`}
-          type='text'
-          maxLength={6}
-          placeholder='6 位数字验证码'
-        />
-      </div>
-      <div className='field-row'>
-        <label htmlFor={`${prefix}-sms-name`}>备注名</label>
-        <Input
-          id={`${prefix}-sms-name`}
-          type='text'
-          placeholder='可选，留空则用脱敏手机号'
-          {...draftProps(`${prefix}-sms-name`)}
-        />
-      </div>
-      <div className='field-row'>
-        <Button id={`${prefix}-sms-submit`}>登录并添加</Button>
-        <span className='detail' id={`${prefix}-sms-hint`} />
+      <div className='sms-form'>
+        {/* 第 1 行：手机号与发码合成一格。按钮内嵌在输入框尾部（组件库的
+            InputGroup，就是为「输入框带一个动作」准备的），不再自己占一行 */}
+        <div className='sms-field'>
+          <label className='lb' htmlFor={`${prefix}-sms-phone`}>
+            手机号<i className='req'>*</i>
+          </label>
+          <InputGroup>
+            <InputGroupInput
+              id={`${prefix}-sms-phone`}
+              type='text'
+              maxLength={11}
+              placeholder='11 位大陆手机号'
+              {...draftProps(`${prefix}-sms-phone`)}
+            />
+            <InputGroupAddon align='inline-end'>
+              {/* 引擎在 create() 时就绑上这一颗的 click（文案与禁用态也归它管）。
+                  ghost + 主色字：不描边框，也不在 30px 高的输入框里再嵌一个盒子 */}
+              <InputGroupButton id={`${prefix}-sms-send`} className='text-primary-fg'>
+                获取验证码
+              </InputGroupButton>
+            </InputGroupAddon>
+          </InputGroup>
+        </div>
+
+        {/* 第 2 行：验证码只占 118px（6 个数字），右边并上同样是短字段的备注名 */}
+        <div className='sms-field'>
+          <label className='lb' htmlFor={`${prefix}-sms-code`}>
+            验证码<i className='req'>*</i>
+          </label>
+          <div className='sms-pair'>
+            {/* 验证码**不进草稿**：引擎在登录成功后会把它清掉（codeNode.value = ''），
+                草稿若留着，下次挂载会把这个已经用过的码填回去 —— 手机号与备注名照旧留 */}
+            <Input
+              id={`${prefix}-sms-code`}
+              className='sms-code'
+              type='text'
+              maxLength={6}
+              placeholder='6 位数字'
+            />
+            <label className='lb-inline' htmlFor={`${prefix}-sms-name`}>备注名</label>
+            <Input
+              id={`${prefix}-sms-name`}
+              className='sms-name'
+              type='text'
+              placeholder='可选，留空则用脱敏手机号'
+              {...draftProps(`${prefix}-sms-name`)}
+            />
+          </div>
+        </div>
+
+        <div className='sms-foot'>
+          <Button id={`${prefix}-sms-submit`}>登录并添加</Button>
+          {/* 失败时引擎会给它挂 .err（见 setHint） */}
+          <span className='detail sms-hint' id={`${prefix}-sms-hint`} />
+        </div>
       </div>
     </DialogSection>
   )
@@ -582,6 +617,19 @@ export function ProviderBlock({
   )
 }
 
+/**
+ * 账号版本 → provider id。
+ *
+ * WorkBuddy 拆家（2026-10）后两个地区是**两家 provider**（`workbuddy` /
+ * `workbuddy-intl`，见 `providers::workbuddy::region`）。界面上仍然是同一个
+ * 「添加账号」块里的一个分段控件，因此这个映射只在这里写一份 —— 壳侧按它记录
+ * 「这次登录属于哪一家」、后端按它决定账号落进哪一组，写错任一处的症状都是
+ * 「用国际版登录、账号进了国内版组」（转发稳定 401）。
+ */
+function workbuddyProviderId(edition: Edition): string {
+  return edition === 'intl' ? 'workbuddy-intl' : 'workbuddy'
+}
+
 /* ─── WorkBuddy（账号版本 + 网页登录 + 第三方入口开关）───────
  *
  * 结构与其余各家不同：它有两处静态分段（账号版本 / 打开方式）与一个第三方入口
@@ -606,7 +654,13 @@ export function WorkBuddyBlock({ active }: { active: boolean }): React.ReactElem
     const engine = shared().wbWebLogin
     if (!engine) return
     controllerRef.current = engine.create({
-      provider: 'workbuddy',
+      // provider 随分段控件**动态解析**（getter）：引擎按
+      // `loginProvider === config.provider` 判断「等待中的是不是本家」，
+      // 写死一个 id 会让切到国际版之后按钮禁用态、取消与提示全部失联
+      // （壳侧记的是 workbuddy-intl）。
+      get provider() {
+        return workbuddyProviderId(editionRef.current)
+      },
       buttonId: 'web-login-button',
       cancelId: 'web-login-cancel',
       hintId: 'web-login-hint',
@@ -623,7 +677,9 @@ export function WorkBuddyBlock({ active }: { active: boolean }): React.ReactElem
       start: () => shared().workbuddyDesktop?.startLogin(
         editionRef.current,
         modeRef.current,
-        'workbuddy',
+        // 归属取当前分段：拆家后它是权威（后端按 provider id 反查地区，
+        // 不再从 `edition` 反推，见 api::session 的 login_start）
+        workbuddyProviderId(editionRef.current),
         socialRef.current,
       ),
       onSuccess: async () => {
@@ -674,7 +730,10 @@ export function WorkBuddyBlock({ active }: { active: boolean }): React.ReactElem
     <div className='add-provider-block' hidden={!active}>
       <DialogSection>
         <h3>账号版本</h3>
-        <p>两版账号可同时保存，按账号自动路由。</p>
+        <p>
+          两版账号可同时保存，各自一份模型清单（国内版与国际版是两家提供商，
+          可分别启用与映射）。
+        </p>
         <SegmentedControl
           aria-label='账号版本'
           className={ADD_SEG_CLASS}

@@ -1,6 +1,9 @@
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
 import { Badge, Button, Checkbox, Input, Switch } from '@ui'
+// 「把检查结果交给更新弹窗」与 app.js 的轮询同一条出口，实现在更新家族的共享模块里
+// （它自带那一族的桥类型与弹窗判定，见 update-shared.ts 的 forwardUpdateResult）
+import { forwardUpdateResult } from './update-shared'
 
 /**
  * 定时任务面板（间隔型任务 + 自动签到）—— 本项目的第一个**面板岛**。
@@ -173,6 +176,14 @@ function shared(): SharedWindow {
 
 /** 自动签到在界面上的 id：它不是间隔型任务，但要在同一个列表里排序与定位 */
 const CHECKIN_ID = 'autoCheckin'
+
+/**
+ * 「软件版本检查」的任务 id（后端 `config::KEY_UPDATE_CHECK`）。
+ *
+ * 单独起一个常量是因为这一条在 runTask 里有个**额外动作**：查到新版本要把结果转给
+ * 更新面板弹窗（见 forwardUpdateResult），不是跑完报一句就完事。
+ */
+const UPDATE_CHECK_ID = 'updateCheck'
 
 /**
  * 自动签到的说明文案（问号 tooltip 的内容）。
@@ -564,6 +575,10 @@ function TasksPanel() {
       // 立即查询积分刚写下一份新快照，让账号页马上应用它 —— 否则用户点完
       // 「立即执行」切到账号页，看到的还是上一次的旧余额
       if (task.id === 'usageQuery') await shared().wbAccountsView?.syncBalancesSnapshot?.()
+      // 软件版本检查：查到新版本就弹出「检测到更新」弹窗（与设置页「检查更新」、定时
+      // 任务到期后轮询到结果时同一个弹窗）。放在最后：它只影响别处的展示，跑完本页的
+      // 状态更新与刷新都完成了再播报，用户先看到本页的结果
+      if (task.id === UPDATE_CHECK_ID) await forwardUpdateResult()
     } catch (error) {
       toast(`执行失败：${errorMessage(error)}`, 'err')
       await loadPanel()

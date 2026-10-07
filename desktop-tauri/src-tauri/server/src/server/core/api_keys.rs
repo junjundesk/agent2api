@@ -363,3 +363,99 @@ pub fn remove(id: &str) -> Result<(), String> {
     save(&entries);
     Ok(())
 }
+
+/// 把某个 provider id 从**所有** Key 的「可用提供商」白名单里摘掉（级联清理）。
+///
+/// 调用点在「删除一个家」之后（`api::custom_providers::remove_custom_provider`）：
+/// 家没了，白名单里那条 id 就成了一条**永远命中不了**的限制 —— 只限制了这一家的
+/// Key 会变成「谁都进不来」（每个请求都被 `key_scope` 拒掉），而 Key 行上显示的
+/// 还是一串看不出所以然的 `custom-xxxx`。清理动作让这件事回到用户能理解的状态。
+///
+/// ── 为什么在这里、而不在 `custom_providers::remove` 里 ──────────
+/// `custom_providers` 是配置层的一个数据模块，它认识 `AccountStore` 已经是为了
+/// 级联账号（同一条取舍，见那边的说明）；再让它认识 apiKeys 这张表的写入，就是
+/// 把两张表的写入耦合进一个数据模块。多表协调住在管理 API 层更合适 ——
+/// 那里也正是「新建家 + 首个账号」做两步回滚的地方。
+///
+/// ── 返回值与「可能放宽成不限制」这件事 ───────────────────────
+/// 返回**被改动的**记录（摘完后的形态；没提过这家的 Key 不在其中），调用方按
+/// `allowed_providers.is_empty()` 就能数出「其中几把已恢复为不限制」。这一点必须
+/// 让调用方看见并说出去：白名单**空 = 不限制**（见模块头），一把只限制了这一家的
+/// Key 被摘完就是空 —— 它从「谁都进不来」变成「哪家都能进」。这是删掉该家必然带来
+/// 的语义变化，不是本函数能消灭的东西；两种坏结局里，留一个死 id 让这把 Key 永远
+/// 404（且界面上看不出原因）更难查，所以如实放宽、由调用方在日志与界面上点名。
+///
+/// 比对忽略大小写（与 `key_scope` 的判定、写入侧的去重同一口径）：手改配置塞进来
+/// 的 `CUSTOM-xxx` 在转发时照样命中这一家（判定会归一成小写），清理时不认它就会漏
+/// 掉一条。只改**真的提到过这家**的记录 —— 其余记录一个字节都不动（一次删除不该
+/// 顺手重写别的 Key）。
+pub fn strip_provider_from_allowlists(provider_id: &str) -> Vec<ApiKeyEntry> {
+    let id = provider_id.trim();
+    if id.is_empty() {
+        return Vec::new();
+    }
+    let mut entries = list();
+    let mut touched: Vec<ApiKeyEntry> = Vec::new();
+    for entry in entries.iter_mut() {
+        let before = entry.allowed_providers.len();
+        entry
+            .allowed_providers
+            .retain(|known| !known.eq_ignore_ascii_case(id));
+        if entry.allowed_providers.len() == before {
+            continue;
+        }
+        touched.push(entry.clone());
+    }
+    if !touched.is_empty() {
+        save(&entries);
+    }
+    touched
+}
+
+/// WorkBuddy 拆家（2026-10）的白名单补齐：把提到过 `workbuddy` 的 Key 补上
+/// `workbuddy-intl`。
+///
+/// ── 为什么必须做（不做的后果是静默 400）──────────────────────
+/// 拆家前 `workbuddy` 这一个 id 覆盖国内版与国际版两个站点，因此「限了
+/// WorkBuddy」的 Key 本来就是**两地都能用**。拆家后国际版是另一个 id，
+/// 不补的话那把 Key 对国际版账号会报「该 Key 不允许使用该提供商」——
+/// 用户什么都没改，功能却少了一半，而报错文案指向 Key 的限制配置，
+/// 与真实原因（我们拆了家）完全无关，极难自查。
+///
+/// ── 为什么是「补齐」而不是「把 workbuddy 换成两个」────────────
+/// 原白名单里的 `workbuddy` 保持不动（国内版仍是那一个 id），只**追加**
+/// 国际版 —— 拆家前后的可用集合因此逐字相同，没有放宽也没有收紧。
+///
+/// 幂等：已经同时含两家的记录不再改动。只处理**真的提到过国内版**的记录：
+/// 没提过的（不限制，或只限了别家）一个字节都不动 —— 一条 Key 的限制集合是
+/// 用户写明的东西（与 `strip_provider_from_allowlists` 同一纪律）。
+/// 返回被改动的记录供日志点名。
+pub fn add_intl_to_workbuddy_allowlists() -> Vec<ApiKeyEntry> {
+    use crate::server::core::providers::{kind_id, ProviderKind};
+    let cn = kind_id(ProviderKind::WorkBuddy);
+    let intl = kind_id(ProviderKind::WorkBuddyIntl);
+    let mut entries = list();
+    let mut touched: Vec<ApiKeyEntry> = Vec::new();
+    for entry in entries.iter_mut() {
+        if !entry
+            .allowed_providers
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(cn))
+        {
+            continue;
+        }
+        if entry
+            .allowed_providers
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(intl))
+        {
+            continue;
+        }
+        entry.allowed_providers.push(intl.to_string());
+        touched.push(entry.clone());
+    }
+    if !touched.is_empty() {
+        save(&entries);
+    }
+    touched
+}

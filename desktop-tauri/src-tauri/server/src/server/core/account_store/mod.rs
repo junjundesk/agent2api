@@ -93,6 +93,7 @@ pub mod catpaw_import;
 pub mod cline_accounts;
 pub mod codearts_accounts;
 pub mod custom_accounts;
+pub mod loomy_accounts;
 pub mod priority;
 pub mod qoder_accounts;
 pub mod raccoon_accounts;
@@ -164,6 +165,11 @@ pub(crate) const TRAE_PROVIDER_ID: &str =
 pub(crate) const QODER_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::Qoder,
 );
+
+/// Loomy（讯飞）provider id（账号存储内部多处要用；**从注册表推导**，同
+/// [`TRAE_PROVIDER_ID`] 的口径）。账号形态见 `loomy_accounts.rs`。
+pub(crate) const LOOMY_PROVIDER_ID: &str =
+    crate::server::core::providers::kind_id(crate::server::core::providers::ProviderKind::Loomy);
 
 /// Cline **免费池** provider id（账号存储内部多处要用；**从注册表推导**，同
 /// [`RACCOON_PROVIDER_ID`] 的口径）。账号形态见 `cline_accounts.rs`。

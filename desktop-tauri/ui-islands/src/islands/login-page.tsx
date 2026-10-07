@@ -4,7 +4,7 @@
  * 这一页独立于主面板（没有 index.html 那套骨架，也不属于任何 .page），界面整块由
  * 本岛渲染。但**登录逻辑仍归页面底部那段内联脚本**：它按 id 直接读写
  * #username / #password / #submit / #error / #mode-tip，还把 submit 处理器挂在
- * #form 上（capture 阶段，先于官方 widget 的 form 集成）。所以本岛刻意做成
+ * #form 上（capture 阶段，先于页面里其它 submit 监听）。所以本岛刻意做成
  * 「渲染一次就不再更新」—— 不持 state、不重渲染，脚本对这些节点的命令式改动
  * （按钮文案与禁用、错误行、占位符、提示行）才不会被 React 覆盖回去。
  * 动这个文件之前请先读那段脚本，它是这一页真正的行为来源。
@@ -29,23 +29,15 @@ import { Button, Input, Label } from '@ui'
 const HOST_ID = 'login-app'
 
 /**
- * ALTCHA 官方 widget：第三方自定义元素，协议见 server::altcha。
+ * 机器人校验组件：`<panel-captcha>` 由 ui/panel-captcha.js 定义（协议见
+ * server::altcha，文件头注释解释了为什么不用官方 altcha widget —— 它在
+ * http://<内网IP> 这类非安全上下文里没有 crypto.subtle，会一直卡在「验证中…」）。
  *
  * 用 createElement 而不是 JSX 标签：TS 的 IntrinsicElements 里没有这个标签，而为一个
- * 第三方标签去扩全局 JSX 命名空间会波及其他岛（也可能与并行迁移的文件撞车）。
- * React 对自定义元素的属性就是 setAttribute（true 写成空属性、字符串原样写入），
- * 与手写 HTML 等价 —— widget 正是靠 getAttribute 读 strings / hidefooter 的。
- *
- * 文案包逐字搬自改写前的 login.html；`hidefooter` 隐藏 altcha.org 的外链 footer。
+ * 自家自定义元素去扩全局 JSX 命名空间会波及其他岛（也可能与并行迁移的文件撞车）。
+ * 元素只认 id：领题端点、文案、事件都在组件内部，这里不传任何属性。
  */
-const altchaWidget = React.createElement('altcha-widget', {
-  id: 'altcha',
-  challengeurl: '/api/panel/captcha',
-  name: 'altcha',
-  hidefooter: true,
-  strings:
-    '{"aria":"我不是机器人","label":"我不是机器人","verified":"验证成功","verifying":"验证中…","wait":"请稍候…","error":"验证失败，请重试","expired":"验证已过期，请重试","footer":"由 ALTCHA 保护"}',
-})
+const captchaWidget = React.createElement('panel-captcha', { id: 'captcha' })
 
 /**
  * 卡片外壳与其中的表单。
@@ -89,8 +81,8 @@ function LoginPage() {
           密码
         </Label>
         <Input id='password' type='password' autoComplete='new-password' placeholder='至少 8 位' />
-        {/* 勾一下「我不是机器人」→ 后台算题 → 绿勾已验证 */}
-        {altchaWidget}
+        {/* 领题求解放后台跑 → 绿勾已验证（组件见 ui/panel-captcha.js） */}
+        {captchaWidget}
         {/* type='submit' 必须显式给：Base UI 的 useButton 会给原生 button 补一个
             type="button"，只有显式传入（合并时外部 props 优先）才盖得掉 */}
         <Button id='submit' type='submit' size='lg' className='w-full'>

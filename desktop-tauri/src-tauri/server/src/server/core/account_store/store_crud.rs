@@ -40,7 +40,7 @@ use crate::server::core::account_store::priority::{
     next_free_priority, normalize_priority, renumber_consecutively, DEFAULT_PRIORITY,
 };
 use crate::server::core::account_store::sql;
-use crate::server::core::account_store::state::StoredAccount;
+use crate::server::core::account_store::state::{mark_name_custom, StoredAccount};
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{
     js_string, number_or, object_or_empty, optional_text, pick_token, token_tail_of, truncate_chars,
@@ -61,11 +61,27 @@ impl AccountStore {
     /// 可含 uid/nickname/expiresAt/domain）。edition 决定端点/prefixPath/platform
     /// 默认值；显式传入的 endpoint/prefixPath/platform 优先。
     /// 新账号的优先级取「现有最大值 + 1」即排在队尾，不会抢占当前账号。
+    ///
+    /// ── `provider` 是**归属**，不是可选项（2026-10 WorkBuddy 拆家）──────
+    /// 本函数服务 workbuddy 系的两家（`workbuddy` 国内版 / `workbuddy-intl`
+    /// 国际版），归属由调用方给出：登录链路按用户选的地区、手动添加按请求体里的
+    /// provider。**更新既有记录时沿用记录自己的归属**（改了会等于把账号搬家，
+    /// 那不是这个接口的语义）；新建时才用传入值，缺省仍是 `workbuddy`
+    /// （历史契约：老客户端不带 provider 字段）。
+    ///
+    /// `provider` 只接受 workbuddy 系的两个 id（本函数的凭证形态是这一家的：
+    /// `uid` + accessToken/refreshToken + edition）。别家的添加路径各有各的
+    /// 落账号函数（`add_raccoon_account` / `add_autoclaw_account` / …）。
     pub fn add_account(
         &self,
         payload: &Value,
         name: Option<&str>,
+        provider: Option<&str>,
     ) -> Result<Value, AccountStoreError> {
+        let requested_provider = provider
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_PROVIDER_ID);
         let Some(payload_object) = payload.as_object() else {
             return Err(AccountStoreError::bad_request("账号内容必须是 JSON 对象"));
         };
@@ -103,26 +119,34 @@ impl AccountStore {
         // uid 相同（两家 id 空间独立）。若这里沿用既有记录，这条 workbuddy 会话
         // 就会把**小浣熊账号**整条覆写成 workbuddy 记录 —— 账号与凭证一起丢。
         // 因此撞到一个**别的 provider** 的 id 时直接报错，让用户先处理那条记录。
+        //
+        // WorkBuddy 拆家（2026-10）后判据从「必须等于 workbuddy」变成
+        // 「必须等于**本次要写的那一家**」：国内版与国际版是两家，同一个 uid
+        // 落在两家是两条独立记录（`user-<uid>` 的主键冲突因此在这里被拦下 ——
+        // 而 WorkBuddy 的 uid 是上游 uuid，实际不会撞）。
         if let Some(existing) = existing.as_ref() {
             let existing_provider = existing.provider();
-            if existing_provider != DEFAULT_PROVIDER_ID {
+            if existing_provider != requested_provider {
                 return Err(AccountStoreError::bad_request(format!(
-                    "账号 id「{id}」已被{}账号占用，无法用同一 uid 添加 workbuddy 账号（请先处理那个账号）",
-                    existing_provider
+                    "账号 id「{id}」已被{}账号占用，无法用同一 uid 添加{}账号（请先处理那个账号）",
+                    crate::server::core::providers::label_of(&existing_provider),
+                    crate::server::core::providers::label_of(requested_provider)
                 )));
             }
         }
-        // 本账号所属 provider：更新既有记录时**沿用原值**，新建时用默认值。
+        // 本账号所属 provider：更新既有记录时**沿用原值**（改归属等于把账号
+        // 搬家，那不是本接口的语义），新建时用调用方给的那一家（缺省 workbuddy，
+        // 历史契约：老客户端不带 provider 字段）。
         // 注：provider 字段缺失的历史记录由 `StoredAccount::provider()` 兜底成
         // workbuddy，所以这里不会读到空串。
         // 小浣熊的添加路径在 `raccoon_accounts::add_raccoon_account`（键名与
-        // 校验都不同），本函数只服务 workbuddy；撞 id 的反向情况（先有
+        // 校验都不同），本函数只服务 workbuddy 系；撞 id 的反向情况（先有
         // workbuddy 账号、再添加同 userId 的小浣熊账号）由那条路径的
         // 「保留既有未知字段」策略兜住：它不会把 workbuddy 记录改写成 raccoon。
         let provider = existing
             .as_ref()
-            .map(StoredAccount::provider)
-            .unwrap_or_else(|| DEFAULT_PROVIDER_ID.to_string());
+            .map(|record| record.provider().to_string())
+            .unwrap_or_else(|| requested_provider.to_string());
 
         // 代理/优先级校验放在写盘前：非法输入直接报错，不留下半成品记录
         let resolved_proxy = if payload_object.contains_key("proxy") {
@@ -137,14 +161,27 @@ impl AccountStore {
                 .map(|record| value_or_nullish(record.get("proxy"), Value::Null))
                 .unwrap_or(Value::Null)
         };
-        let edition = resolve_edition(
-            payload_object
+        // ── 版本（edition）缺省按**归属**推（2026-10 拆家）──────────
+        // 显式给了就用它（手动添加的「账号版本」下拉、登录会话里带的 context），
+        // 既有记录没给就沿用记录自己的。都没有时按本账号要落的那一家推：
+        // `workbuddy-intl` → 国际版，其余 → 国内版（历史默认）。
+        // 这一步不能省：给国际版账号落一个国内版的端点/prefixPath/platform，
+        // 等于拿国际版凭证去打国内站，必然 401，而症状是「刚加的账号不能用」。
+        let edition = {
+            let explicit = payload_object
                 .get("edition")
                 .filter(|value| !value.is_null())
                 .map(js_string)
-                .or_else(|| existing.as_ref().and_then(StoredAccount::edition))
-                .as_deref(),
-        );
+                .or_else(|| existing.as_ref().and_then(StoredAccount::edition));
+            match explicit {
+                Some(value) => resolve_edition(Some(value.as_str())),
+                None => crate::server::core::providers::workbuddy::Region::from_provider_id(
+                    requested_provider,
+                )
+                .map(|region| region.edition())
+                .unwrap_or_else(|| resolve_edition(None)),
+            }
+        };
         // 新账号默认排在末尾，避免凭空插队改变现有转发顺序；显式指定则校验唯一。
         // 号段与冲突看全部账号（全局一条队列，见模块头）——两者都只在投影列
         // `priority` 上做，不解析任何记录的 JSON：
@@ -187,12 +224,14 @@ impl AccountStore {
             .filter(|value| !value.is_empty())
             .map(|value| truncate_chars(value, 100))
             .filter(|value| !value.is_empty());
+        let explicit = explicit_name.is_some();
         let record_name = explicit_name
             .or_else(|| optional_text(account.get("nickname")))
             .or_else(|| optional_text(payload_object.get("nickname")))
             .or_else(|| existing.as_ref().and_then(|item| optional_text(item.get("name"))))
             .unwrap_or_else(|| format!("账号 {}", truncate_chars(&uid, 8)));
         record.insert("name".to_string(), Value::String(record_name.clone()));
+        mark_name_custom(&mut record, explicit, existing.as_ref());
         record.insert(
             "uid".to_string(),
             Value::String(uid.clone()),
@@ -578,6 +617,11 @@ impl AccountStore {
                     return Err(AccountStoreError::bad_request("备注名不能为空"));
                 }
                 record.set("name", Value::String(next.clone()));
+                // 用户**真正改到**备注名时打标（设置表单每次都会把 name 原样发回来，
+                // 不能按「提交过」打，否则从未设备注的账号保存任意设置后也会被当成
+                // 设过）。种子名与用户改的名在记录里无法区分，界面全靠这个标记区分
+                // 「备注名赢过默认口径」还是「维持原行为」（见 displayNameOf）
+                record.set("nameCustom", Value::Bool(true));
                 changes.push(format!("备注名 → {next}"));
             }
         }
@@ -754,5 +798,46 @@ impl AccountStore {
             },
             "list": self.snapshot(&state),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 备注名标记只随「真正改到 name」出现：设置表单每次都原样回传 name（含从未
+    /// 设过备注的账号），按「提交过」打标会把它们的显示顶成种子值（见 mark_name_custom）。
+    #[test]
+    fn renaming_marks_name_custom_but_same_value_or_other_fields_do_not() {
+        let base = || {
+            StoredAccount::from_map(
+                json!({ "id": "a1", "provider": "workbuddy", "name": "种子名" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+        };
+        let no_holder = |_| Ok(None);
+
+        // 改名：打标
+        let mut record = base();
+        let patch = json!({ "name": "新备注" }).as_object().unwrap().clone();
+        let changes = AccountStore::apply_patch(&mut record, &patch, no_holder).unwrap();
+        assert_eq!(changes, vec!["备注名 → 新备注"]);
+        assert_eq!(record.get("nameCustom"), Some(&Value::Bool(true)));
+
+        // 同值提交（表单原样回传）：不打标
+        let mut record = base();
+        let patch = json!({ "name": "种子名" }).as_object().unwrap().clone();
+        let changes = AccountStore::apply_patch(&mut record, &patch, no_holder).unwrap();
+        assert!(changes.is_empty());
+        assert_eq!(record.get("nameCustom"), None);
+
+        // 改别的字段（优先级）：不打标
+        let mut record = base();
+        let patch = json!({ "priority": 5 }).as_object().unwrap().clone();
+        AccountStore::apply_patch(&mut record, &patch, no_holder).unwrap();
+        assert_eq!(record.get("nameCustom"), None);
     }
 }

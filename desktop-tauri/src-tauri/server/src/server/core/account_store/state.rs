@@ -406,8 +406,28 @@ impl StoredAccount {
     /// `plan: start-plan` 的转发**只用 JWT**（见 `zcode::plan`）—— 只认
     /// `accessToken` 会让这类账号在选路时被跳过，报成「没有可用账号」，
     /// 与「账号明明能用」矛盾。
+    ///
+    /// 第五条判据 `no_auth()` 同样只对自定义账号有效：上游本来就不要鉴权时
+    /// （本地 Ollama、OpenCode Zen 的匿名免费档、自建无反代），「没有 key」
+    /// 不是缺陷而是**这条账号的正常形态**。判据必须**显式**落在记录上 ——
+    /// 只看「apiKey 为空」会把用户忘了填 key 的记录一起放行，表现成一条
+    /// 看不懂的上游 401（见 [`Self::no_auth`]）。
     pub fn has_credentials(&self) -> bool {
         self.has_token() || self.is_desktop() || self.has_api_key() || self.has_jwt()
+            || self.no_auth()
+    }
+
+    /// 记录是否**显式声明「该上游无需鉴权」**（自定义账号的 `noAuth: true`）。
+    ///
+    /// 写入侧保证它与 `apiKey` 互斥（[`super::custom_accounts`] 的两个写入
+    /// 入口都守着这条不变量）：勾了无需鉴权就没有 key 可存，存了 key 就摘掉
+    /// 这个标记。于是「有没有凭证」与「发不发鉴权头」两件事都只有一种读法，
+    /// 转发侧不必再判优先级。
+    ///
+    /// 内置八家的记录里没有这个键（它们各有登录态与刷新链路），判定天然不受
+    /// 影响 —— 也就与 `has_api_key` 同一条「不判 provider」的取舍。
+    pub fn no_auth(&self) -> bool {
+        matches!(self.fields.get("noAuth"), Some(Value::Bool(true)))
     }
 
     /// 记录里是否有**非空**的 `jwt`（ZCode 的套餐令牌）
@@ -455,6 +475,30 @@ impl StoredAccount {
 
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.fields.get(key)
+    }
+}
+
+/// 在记录上打「用户显式设置过备注名」标（`nameCustom`）。
+///
+/// 种子名（凭证账号名 / 昵称 / uid 兜底）与用户改的名落库后都是 `name`，无法
+/// 事后区分 —— 只能在**用户显式给名的时刻**打标：设置弹窗真正改到 name 时
+/// （`apply_patch`），以及添加表单显式填了备注名（各 provider 的添加路径）。
+/// 界面据此分流：有标记备注名恒为主名，无标记维持历史口径（邮箱 / 昵称优先，
+/// 见岛内 displayNameOf）—— 没有它，「备注名优先」会把未设备注账号的显示
+/// 顶成建号时的种子值。
+///
+/// 重加（同 id 再走一次添加）没给新名字时，旧记录的标记要**跟过来**：备注名
+/// 种子链会从旧记录把名字原样种回来，标记丢了它就又被默认口径压住。
+pub(crate) fn mark_name_custom(
+    record: &mut Map<String, Value>,
+    explicit_name: bool,
+    existing: Option<&StoredAccount>,
+) {
+    let carried = existing
+        .and_then(|item| item.get("nameCustom"))
+        .is_some_and(|value| matches!(value, Value::Bool(true)));
+    if explicit_name || carried {
+        record.insert("nameCustom".to_string(), Value::Bool(true));
     }
 }
 
@@ -563,4 +607,30 @@ pub struct SessionById {
     pub session: Value,
     pub proxy: Value,
     pub proxy_error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_name_or_carried_flag_marks_the_record() {
+        // 添加表单显式给名：打标
+        let mut record = Map::new();
+        mark_name_custom(&mut record, true, None);
+        assert_eq!(record.get("nameCustom"), Some(&Value::Bool(true)));
+
+        // 种子名（非显式、旧记录无标）：不打 —— 未设备注的账号要维持原展示口径
+        let mut record = Map::new();
+        mark_name_custom(&mut record, false, None);
+        assert_eq!(record.get("nameCustom"), None);
+
+        // 重加没给新名字：旧记录已打的标要跟过来（备注名从旧记录种回来，标不能丢）
+        let mut previous = Map::new();
+        previous.insert("nameCustom".to_string(), Value::Bool(true));
+        let existing = StoredAccount::from_map(previous);
+        let mut record = Map::new();
+        mark_name_custom(&mut record, false, Some(&existing));
+        assert_eq!(record.get("nameCustom"), Some(&Value::Bool(true)));
+    }
 }

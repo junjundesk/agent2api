@@ -436,10 +436,16 @@ impl AccountStore {
         // 它改的是 id，而 ②③ 的整队要按**旧** id 分组看
         let cline_renamed = Self::migrate_cline_accounts(&mut state);
 
+        // ⑤ WorkBuddy 国际版拆家（见 `migrate_workbuddy_intl_accounts`）。
+        // 只改 `provider`、**不改 id**，因此放在 ②③ 之后没有顺序约束；
+        // 排在 Cline 之后只是让「拆家类迁移」聚在一起。
+        let workbuddy_moved = Self::migrate_workbuddy_intl_accounts(&mut state);
+
         if provider_added == 0
             && assignments.is_empty()
             && !scope_migrated
             && cline_renamed == 0
+            && workbuddy_moved == 0
         {
             return json!({
                 "providerAdded": 0,
@@ -465,6 +471,15 @@ impl AccountStore {
                 "[Accounts]",
                 &format!(
                     "🔀 Cline 已拆为 Cline Free / Cline Pass 两家，{cline_renamed} 个账号已按额度池归位"
+                ),
+            );
+        }
+        if workbuddy_moved > 0 {
+            logging::log(
+                "[Accounts]",
+                &format!(
+                    "🔀 WorkBuddy 已拆为国内版 / 国际版两家，{workbuddy_moved} 个国际版账号已归位\
+                     （凭证、优先级、限流记录与账号 id 均未改动）"
                 ),
             );
         }
@@ -553,6 +568,46 @@ impl AccountStore {
             renamed += 1;
         }
         renamed
+    }
+
+    /// WorkBuddy 国际版拆家：把 `provider == "workbuddy"` 且 `edition == "intl"`
+    /// 的记录归到 `workbuddy-intl`（2026-10，见 `providers::workbuddy::region`）。
+    ///
+    /// ── 为什么不改 id（与 `migrate_cline_accounts` 的差别）──────────
+    /// Cline 那次必须改 id：两个池共用 `cline-...` 的 id 空间，不拆就分不开。
+    /// 本家不需要 —— 两个地区的 uid 是各自上游生成的 uuid，不会撞；而 id 是
+    /// `requests.account_id` 与 `request_daily` 的引用键，改名会让用户在请求
+    /// 日志与报表里再也对不上自己那个账号（详见 `Region` 模块头那段论证）。
+    ///
+    /// ── 判据为什么是 `edition` 而不是账号别的字段 ────────────────
+    /// 拆家前「账号属于哪个地区」这件事**只有** `edition` 一个表达（端点、
+    /// UA、登录站点全部由它派生），所以它就是这次迁移的全部依据。
+    /// `edition` 缺失（旧数据 / 手改）一律按国内版 —— 与 `resolve_edition`
+    /// 的兜底同口径（`StoredAccount::edition()` 返回 None，这里不动它）。
+    ///
+    /// ── 幂等 ────────────────────────────────────────────────────
+    /// 判据是数据本身（`provider == workbuddy && edition == intl`）：迁完就没有
+    /// 这样的记录，再跑一遍返回 0、不写库。与 `migrate_startup` 的其它步骤
+    /// 同一原则（见 `db::migrate` 模块头「数据自己有没有」那段）。
+    fn migrate_workbuddy_intl_accounts(state: &mut AccountState) -> usize {
+        /// 拆家前的唯一 WorkBuddy provider id（只出现在这里）
+        const LEGACY_WORKBUDDY_ID: &str = "workbuddy";
+        let mut moved = 0usize;
+        for record in state.accounts.iter_mut() {
+            if record.provider() != LEGACY_WORKBUDDY_ID {
+                continue;
+            }
+            let region = crate::server::core::providers::workbuddy::Region::from_edition_id(
+                record.edition().as_deref(),
+            );
+            let provider = region.provider_id();
+            if provider == LEGACY_WORKBUDDY_ID {
+                continue;
+            }
+            record.set_provider(provider);
+            moved += 1;
+        }
+        moved
     }
 
     /// 全局重新连续编号，**原地改 state**（不落盘）。
@@ -670,7 +725,14 @@ impl AccountStore {
             "platform": legacy.get("platform").cloned().unwrap_or(Value::Null),
             "edition": legacy.get("edition").cloned().unwrap_or(Value::Null),
         });
-        match self.add_account(&payload, nickname.as_deref()) {
+        // 旧登录态（`auth.json`）是单上游时代的产物：那时进程只有一个上游，
+        // 地区由 `WORKBUDDY_EDITION` 决定，因此这里**按 payload 里的 edition
+        // 归位**（缺失回落国内版，历史行为不变）。
+        let provider = crate::server::core::providers::workbuddy::Region::from_edition_id(
+            payload.get("edition").and_then(Value::as_str),
+        )
+        .provider_id();
+        match self.add_account(&payload, nickname.as_deref(), Some(provider)) {
             Ok(account) => Some(account),
             Err(error) => {
                 logging::log("[Accounts]", &format!("❌ 旧登录态迁移失败: {error}"));

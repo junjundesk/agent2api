@@ -42,8 +42,12 @@ pub mod auto_checkin;
 pub mod billing;
 pub mod captcha;
 pub mod chat;
+pub mod cline_headers;
 pub mod codearts_welfare;
 pub mod config_api;
+// 网关面（`/v1/*`）跨域访问开关：`GET/PUT /api/cors`（与 `/api/sanitize`
+// 同形的单开关端点，见该文件模块头）
+pub mod cors;
 // 自定义提供商的管理接口（新建时顺带创建首个账号；存储与账号接入见
 // `core::custom_providers` 与 `core::account_store::custom_accounts`）
 pub mod custom_providers;
@@ -59,6 +63,9 @@ pub mod import_sources;
 pub mod keys_api;
 pub mod logs_api;
 pub mod model_manage;
+// 模型测试（模型管理页操作列的「测试」）：挂管理面、走真实转发链路，
+// 只把候选收窄到「这一家 × 这一个账号」并把流量标成测试，见该文件模块头
+pub mod model_test;
 pub mod models;
 pub mod panel;
 pub mod pipeline;

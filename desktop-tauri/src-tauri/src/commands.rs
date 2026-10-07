@@ -227,6 +227,125 @@ pub async fn change_port(app: AppHandle, port: u16) -> Result<Value, String> {
     Ok(json!({ "changed": true, "port": port, "restarting": true }))
 }
 
+// ── 局域网访问（issue #48）────────────────────────────────────
+// 三条命令支撑设置页的「局域网访问」面板：查管理员注册状态、注册管理员、
+// 切换局域网访问。与其它壳命令「只做转发」的取向有一处刻意偏离：注册直接调
+// server 库（`access::setup_admin`）而不走 /api/panel/setup —— 那条 HTTP 路径
+// 服务 headless 的公开注册页，带着 ALTCHA 人机验证与公开竞争语义；桌面壳是
+// 本机受信进程，注册发生在**开启局域网监听之前**，两条路径的威胁模型不同。
+// 哈希格式由 `access::hash_password` 收口，两条入口产出互通的凭证。
+
+/// 查面板管理员是否已注册（设置页据此决定「开启局域网访问」要不要先走注册步）。
+#[tauri::command]
+pub fn panel_admin_status() -> Result<Value, String> {
+    Ok(json!({ "registered": crate::server::access::admin_registered() }))
+}
+
+/// 注册面板管理员（桌面壳的受信本地路径，见上组说明）。
+///
+/// 已有管理员时返回 `existed: true` 而不是报错：开启流程只关心「注册完有没有
+/// 管理员」，重复注册（两台设备同时走流程之类的竞态）不该让用户看到失败。
+#[tauri::command]
+pub async fn panel_register(username: String, password: String) -> Result<Value, String> {
+    let username = username.trim();
+    if username.is_empty() || username.chars().count() > 64 {
+        return Err("请填写管理员账号（64 字符以内）".to_string());
+    }
+    if password.len() < 8 {
+        return Err("密码至少 8 位".to_string());
+    }
+    let username = username.to_string();
+    // bcrypt 是刻意的慢函数，放阻塞线程池，别占异步 worker
+    let hash = tauri::async_runtime::spawn_blocking(move || {
+        crate::server::access::hash_password(&password)
+    })
+    .await
+    .map_err(|error| format!("注册任务失败: {error}"))??;
+
+    match crate::server::access::setup_admin(&username, &hash) {
+        Ok(true) => {
+            crate::server::logging::log(
+                "[Security]",
+                &format!("✅ 管理员「{username}」注册完成（桌面端）"),
+            );
+            Ok(json!({ "registered": true }))
+        }
+        Ok(false) => Ok(json!({ "registered": true, "existed": true })),
+        Err(reason) => Err(reason),
+    }
+}
+
+/// 切换局域网访问：校验 →（需要时补首把 Key）→ 写设置 → 重启应用。
+///
+/// ── 开启前必须有面板管理员 ──────────────────────────────────
+/// 监听一出回环，`/api/*` 的安全边界就是「管理员会话或 API Key」；没有管理员
+/// 时这个边界不存在（启动期的未注册闸门只兜异常态）。界面流程是「先注册、
+/// 后开启」，这里再挡一道防绕过。
+///
+/// ── 为什么在开启时补一把默认 Key ────────────────────────────
+/// 闸门与桌面壳自身的管理通道都建立在「至少一把启用的 Key」上：壳对管理 API
+/// 的请求靠自动携带第一把 Key 认证（`gateway::read_api_key`），一把启用的
+/// Key 都没有时，注册过管理员的世界里壳会被自己的闸门挡在外面（用户还没
+/// 来得及建 Key）。开启流程顺手补一把名为「默认」的 Key，并通过返回值告诉
+/// 界面去提示 —— 用户在「网关 Key」页能看到它。
+///
+/// 重启用 [`schedule_app_restart`]：监听地址在 bind 之后就改不了，
+/// 与 `change_port` 同一条铁律。
+#[tauri::command]
+pub fn change_lan_access(app: AppHandle, enabled: bool, panel: bool) -> Result<Value, String> {
+    if enabled && !crate::server::access::admin_registered() {
+        return Err("尚未注册面板管理员：请先完成注册再开启局域网访问".to_string());
+    }
+    // 面板托管只在局域网开启时有意义；关闭时一并归位
+    let panel = enabled && panel;
+
+    let mut created_key = None;
+    if enabled && crate::server::config::current().active_api_keys().is_empty() {
+        let entry = crate::server::core::api_keys::add("默认", None, Vec::new(), Vec::new())
+            .map_err(|message| format!("自动创建网关 Key 失败: {message}"))?;
+        crate::server::logging::log(
+            "[Config]",
+            &format!("✅ 已自动创建网关 Key「{}」（局域网访问开启流程）", entry.name),
+        );
+        created_key = Some(entry.public_json());
+    }
+
+    let mut current = settings::load();
+    current.lan_access = enabled;
+    current.lan_panel = panel;
+    settings::save(&current)?;
+
+    schedule_app_restart(&app);
+    Ok(json!({
+        "changed": true,
+        "enabled": enabled,
+        "panel": panel,
+        "restarting": true,
+        "createdKey": created_key,
+    }))
+}
+
+/// 本机在局域网里的地址（给「局域网访问」面板显示 `http://<IP>:<端口>/v1` 用）。
+///
+/// UDP connect 不发任何包，只是让内核按路由表选出默认出口的源地址 —— 机器
+/// 有多块网卡时它就是「别人最可能访问到的那块」。拿不到（没有网络 / 只有
+/// 回环）返回 null：这不是调用失败，界面按「查不到地址」显示，不弹错误。
+#[tauri::command]
+pub fn local_ip() -> Result<Option<String>, String> {
+    let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
+        Ok(socket) => socket,
+        Err(_) => return Ok(None),
+    };
+    if socket.connect("8.8.8.8:80").is_err() {
+        return Ok(None);
+    }
+    Ok(socket
+        .local_addr()
+        .ok()
+        .map(|addr| addr.ip().to_string())
+        .filter(|ip| ip != "0.0.0.0" && ip != "127.0.0.1"))
+}
+
 /// 发起登录；阻塞到完成/失败/取消/超时。
 ///
 /// `provider` 是 Option：老版本界面不会传它，缺省（None）按 workbuddy 处理 ——

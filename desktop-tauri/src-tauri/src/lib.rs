@@ -163,6 +163,10 @@ pub fn run() {
             commands::restart_app,
             commands::check_port,
             commands::change_port,
+            commands::panel_admin_status,
+            commands::panel_register,
+            commands::change_lan_access,
+            commands::local_ip,
             commands::start_login,
             commands::start_autoclaw_oauth_login,
             commands::login_state,
@@ -300,7 +304,28 @@ pub fn run() {
             // 注：macOS 上这会一并去掉「红绿灯」，本项目面向 Windows
             // （NSIS 安装包），macOS 如需保留要用 titleBarStyle: Overlay
             // 另行适配，此处不做特殊处理。
-            WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
+            // ── WebView2 后台保活参数（Windows 专属）──────────────────────
+            // 关闭到托盘或窗口最小化时，Chromium 默认会对后台窗口启用定时器节流
+            // （Timer Throttling）与挂起，导致后台验证码铸造循环（ui/zcode-captcha-pool.js）
+            // 的 setTimeout 被严重降频甚至冻结。解除这三项节流限制以维持后台令牌正常补充。
+            //
+            // 开头的 `--disable-features=…` **不能省**：wry 对 additional_browser_args 是
+            // **替换**语义（`unwrap_or_else`，见 wry 的 webview2/mod.rs），设了它就看不到
+            // wry 的默认值 —— 而默认值里正有关掉 WebView2「⋯」溢出菜单与 SmartScreen 检查
+            // 的那三项（Tauri 在 additional_browser_args 的文档警告里说明了这一点）。
+            // 后面三项才是本 PR 新增的保活开关，与前缀互不冲突，可以并在一串里。
+            #[cfg(target_os = "windows")]
+            let builder = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
+                .additional_browser_args(
+                    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+                     --disable-background-timer-throttling \
+                     --disable-backgrounding-occluded-windows \
+                     --disable-renderer-backgrounding",
+                );
+            #[cfg(not(target_os = "windows"))]
+            let builder = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()));
+
+            builder
                 .title(app_title())
                 .decorations(false)
                 .inner_size(WIN_WIDTH, WIN_HEIGHT)

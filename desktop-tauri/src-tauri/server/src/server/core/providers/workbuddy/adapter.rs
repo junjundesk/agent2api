@@ -9,9 +9,9 @@
 //!   - 头集合与 URL        ← `upstream::request::{chat_headers, chat_completions_url}`
 //!   - system 注入         ← `upstream::request::ensure_leading_system_message`
 //!   - 429 / 6004 判定     ← `upstream::request::is_quota_limit_error` + `errors::parse_quota_reset_at`
-//!   - 11128 退避建议      ← 本文件 `RATE_LIMIT_CODE`（次数 / 间隔走全局重试设置）
+//!   - 11-128 退避建议      ← 本文件 `RATE_LIMIT_CODE`（次数 / 间隔走全局重试设置）
 //!   - token 临期刷新      ← `auth::{get_current_session, is_token_expiring, refresh_account}`
-//!   - 模型清单            ← `core::models::global_catalog()`
+//!   - 模型清单            ← `core::models::global_catalog(region)`
 //!
 //! ── 出站归一化（2026-09 新增，子模块 `normalize`）──────────────
 //! 上表里「system 注入」那一行的**职责被拆开了一部分**：`developer→system`
@@ -21,18 +21,21 @@
 //! 那是从参考项目 workbuddy2api 移植的本家形态适配，与「搬」进本模块的既有
 //! 逻辑不同源 —— 见 `normalize.rs` 模块头。
 //!
-//! ── 为什么清单与刷新放在这里而不是只做转发 ────────────────────
-//! 聚合目录（`providers/catalog.rs`）在 W2a 里按 `ProviderKind` 分支直接读
-//! `core::models`，并注明「W3 换成适配器注册表时改的就只是 manifest_for」。
-//! 本波把那条路径接上适配器（`list_models` / `refresh_models`），
-//! 于是「这一家的模型从哪来、怎么刷」在本文件里一眼可见，
-//! 聚合层与转发层都不再认识 workbuddy 的细节。
+//! ── 国内版 / 国际版 = 两个实例（2026-10 拆分）─────────────────
+//! 适配器持有一个 [`Region`]：两端协议完全相同，差别只在站点与客户端身份
+//! （UA / platform / 产品名），以及**各自独立的模型目录与缓存槽**。
+//! 因此本结构按地区参数化，两个静态实例由 `adapter_for` 按 kind 给出 ——
+//! 与 `autoclaw::adapter` / `zcode::adapter` / `accio::adapter` 同一形态。
+//! 拆家的完整理由见 `workbuddy::region` 的模块头（issue #74 / #89）。
 //!
 //! ── 默认登录态（`WORKBUDDY_TOKEN` 旁路）─────────────────────
 //! workbuddy 独有的「一个账号都没有时也能转发」能力（脚本 / CI 用户）：
 //! 反映在 `allows_anonymous_default_session()` 与 `ensure_access_token`
 //! 的空 account_id 分支上。这是**行为兼容**的一部分，不是可选优化 ——
 //! 去掉它会让 `WORKBUDDY_TOKEN` 用户的 `/v1/chat/completions` 直接 401。
+//! 拆家后变量按地区分开（国内 `WORKBUDDY_TOKEN`、国际 `WORKBUDDY_INTL_TOKEN`，
+//! 旧组合 `WORKBUDDY_EDITION=intl` + `WORKBUDDY_TOKEN` 仍可用），见
+//! `Region::env_token`。
 //!
 //! ── panic=abort ────────────────────────────────────────────
 //! 本文件在对话链路上，**绝不** unwrap/expect/panic：所有取值都走
@@ -46,24 +49,22 @@ use crate::server::core::auth::{is_token_expiring, AuthService};
 use crate::server::core::models::global_catalog;
 use crate::server::errors::GatewayError;
 
-use super::adapter::{
+use super::super::adapter::{
     ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, RetryAdvice, UpstreamErrorClass,
 };
-use super::content_block;
-use super::ProviderKind;
+use super::super::content_block;
+use super::super::ProviderKind;
+use super::region::Region;
+use super::normalize;
 
-/// 出站请求体归一化（角色 / tool_choice / image_url / max_tokens / tool 配对 /
-/// 前缀缓存键），从参考项目 workbuddy2api 移植。见该模块头的完整说明。
-mod normalize;
-
-/// 上游错误码 11128（历史文案：Illegal API invocation from an unapproved channel）。
+/// 上游错误码 11-128（历史文案：Illegal API invocation from an unapproved channel）。
 ///
 /// 实测语义：多为提示词命中上游敏感词审核而被拦截（并非单纯的频率风控）。
 /// 常量名沿用 Node 版的历史命名，不要据此理解成「频率限制」。
 /// 拦截会持续一小段时间，期间客户端失败自动重试会形成重试风暴并给拦截续期，
-/// 因此命中 11128 时值得退避重试 —— 次数与间隔统一走设置页的「请求重试」
+/// 因此命中 11-128 时值得退避重试 —— 次数与间隔统一走设置页的「请求重试」
 /// （历史硬编码是 10 秒 / 25 秒各一次；间隔设得过短会拉长拦截窗口，建议 ≥10 秒）。
-const RATE_LIMIT_CODE: i64 = 11128;
+const RATE_LIMIT_CODE: i64 = 11-128;
 
 /// 上游要求首条消息必须是 system prompt，否则返回 400
 /// （first message is not system prompt）。客户端没带 system 消息时注入一条兜底系统消息。
@@ -74,24 +75,52 @@ const DEFAULT_SYSTEM_PROMPT: &str = "你是一个得力助手";
 /// —— 恢复时间只在文本里，由 `errors::parse_quota_reset_at` 解析。
 const QUOTA_LIMIT_CODE: i64 = 6004;
 
-/// 11128 透传给客户端时追加的敏感词指引（避免被误当成普通频率限制）
+/// 11-128 透传给客户端时追加的敏感词指引（避免被误当成普通频率限制）
 const WAF_HINT: &str = "；提示词可能命中上游敏感词，请检查提示词";
 
 /// WorkBuddy 适配器（无状态单例，见 `adapter::adapter_for`）。
-pub struct WorkBuddyAdapter;
+///
+/// 唯一的字段是地区：两端协议一致，地区决定端点兜底、客户端身份（UA /
+/// platform / 产品名）与**要读哪一份模型目录**。
+pub struct WorkBuddyAdapter {
+    /// 本实例服务的地区（国内版 / 国际版）
+    region: Region,
+}
 
-/// 进程级实例：适配器无状态，静态实例即可（`adapter_for` 返回它的引用）
-pub static WORKBUDDY_ADAPTER: WorkBuddyAdapter = WorkBuddyAdapter;
+impl WorkBuddyAdapter {
+    /// 构造某个地区的适配器（`const`：两个实例都是静态量）
+    pub const fn new(region: Region) -> Self {
+        Self { region }
+    }
+
+    /// 本实例服务的地区
+    pub const fn region(&self) -> Region {
+        self.region
+    }
+
+    /// 本地区的模型目录句柄（进程级，与 `/v3/config` 刷新共用同一份状态）
+    fn catalog(&self) -> crate::server::core::models::ModelCatalog {
+        global_catalog(self.region)
+    }
+}
+
+/// 进程级实例：适配器无状态（地区是构造期常量），静态实例即可
+/// （`adapter_for` 返回它的引用）
+pub static WORKBUDDY_ADAPTER: WorkBuddyAdapter = WorkBuddyAdapter::new(Region::Cn);
+/// 国际版实例（拆家后与国内版各自独立，见模块头）
+pub static WORKBUDDY_INTL_ADAPTER: WorkBuddyAdapter = WorkBuddyAdapter::new(Region::Intl);
 
 impl ProviderAdapter for WorkBuddyAdapter {
     fn kind(&self) -> ProviderKind {
-        ProviderKind::WorkBuddy
+        self.region.kind()
     }
 
     /// workbuddy 的模型清单（`core::models` 的进程级句柄，与启动时 /v3/config
     /// 刷新的是同一份 RwLock 状态）。
+    ///
+    /// **按本实例的地区取**：两个地区各有一份（拆家前挤在同一份里，谁刷谁覆盖）。
     fn list_models(&self) -> Vec<Value> {
-        global_catalog().list()
+        self.catalog().list()
     }
 
     /// 构造 `POST {endpoint}/v2/chat/completions` 的请求（头集合与 URL 逐字沿用
@@ -141,9 +170,10 @@ impl ProviderAdapter for WorkBuddyAdapter {
             }
             None => normalized,
         };
-        let url = chat_completions_url(session);
+        let url = chat_completions_url(session, self.region);
         let headers = chat_headers(
             session,
+            self.region,
             &crate::server::core::upstream::request::new_request_id(),
             Some("text/event-stream"),
         );
@@ -153,7 +183,7 @@ impl ProviderAdapter for WorkBuddyAdapter {
     /// 上游错误分类（照抄改造前 `upstream` 的判定与文案）：
     ///   - 401 → TokenExpired（刷新后同账号重试一次）
     ///   - 429 或 code 6004 → QuotaLimited（冷却 + 换账号）
-    ///   - 内容策略拦截（11128 或审核文案）→ ContentBlocked（**不罚账号**：换中性提示词后
+    ///   - 内容策略拦截（11-128 或审核文案）→ ContentBlocked（**不罚账号**：换中性提示词后
     ///     同账号重试一次 + 触发降级，见 `core::degrade`）
     ///   - 其余 → Fatal（原样透传）
     ///
@@ -181,11 +211,11 @@ impl ProviderAdapter for WorkBuddyAdapter {
                 status,
             };
         }
-        // 11128 透传时追加敏感词指引（改造前在 rotate::request_with_waf_retry 里）
+        // 11-128 透传时追加敏感词指引（改造前在 rotate::request_with_waf_retry 里）
         let is_waf_code = code == Some(RATE_LIMIT_CODE);
         let hint = if is_waf_code { WAF_HINT } else { "" };
         let message = format!("上游返回 {status}: {raw}{hint}");
-        // 内容策略拦截（11128 及其历史文案）：**不罚账号**，交给编排层降级到
+        // 内容策略拦截（11-128 及其历史文案）：**不罚账号**，交给编排层降级到
         // 中性提示词后同账号重试一次（见 `core::degrade`）。判据取并集 ——
         // 业务码兜住「上游改了文案」、共用文案规则兜住「上游改了码」，两条
         // 指向的是同一件事（论证见 `providers::content_block` 模块头）。
@@ -220,7 +250,7 @@ impl ProviderAdapter for WorkBuddyAdapter {
     /// - `account_id` 非空 → 该账号的 token；临期且可刷新时自动刷新
     ///   （改造前 `auth::get_current_session` 对「当前账号」做同一件事，
     ///   这里按**指定账号**做，因为编排层是逐账号尝试的）。
-    /// - `account_id` 为空 → 默认登录态（环境变量或存储派生的当前账号）。
+    /// - `account_id` 为空 → 本地区的默认登录态（环境变量或存储派生的当前账号）。
     fn ensure_access_token<'a>(
         &'a self,
         store: &'a AccountStore,
@@ -230,7 +260,7 @@ impl ProviderAdapter for WorkBuddyAdapter {
     > {
         Box::pin(async move {
             if account_id.is_empty() {
-                return default_session_token(store).await;
+                return default_session_token(store, self.region).await;
             }
             let entry = store.get_session_by_id(account_id).ok_or_else(|| {
                 GatewayError::with_status(401, format!("账号 {account_id} 没有可用凭证"))
@@ -332,7 +362,7 @@ impl ProviderAdapter for WorkBuddyAdapter {
         })
     }
 
-    /// 刷新模型目录：沿用既有的「按当前账号刷新 /v3/config」实现
+    /// 刷新**本地区**的模型目录：沿用既有的「按当前账号刷新 /v3/config」实现
     /// （`core::models::ModelCatalog::refresh_with_current_account`）。
     ///
     /// ── `force` 对本家无差别（有意）─────────────────────────────
@@ -364,7 +394,8 @@ impl ProviderAdapter for WorkBuddyAdapter {
             let auth = AuthService::for_store(store.clone());
             // `account_id` 非空 = 用户在「获取模型」弹窗里点名的那条账号
             // （见 `refresh_with_current_account` 的三档选取）
-            let outcome = global_catalog()
+            let outcome = self
+                .catalog()
                 .refresh_with_current_account(store, &auth, account_id)
                 .await;
             if outcome.refreshed {
@@ -382,10 +413,10 @@ impl ProviderAdapter for WorkBuddyAdapter {
         true
     }
 
-    /// 11128 退避建议（改造前 `rotate::request_with_waf_retry` 的判定；
+    /// 11-128 退避建议（改造前 `rotate::request_with_waf_retry` 的判定；
     /// 次数与间隔改由设置页的「请求重试」统一提供）。
     ///
-    /// **循环**留在编排层（架构文档 §4.3「11128 退避逻辑保持在转发层」），
+    /// **循环**留在编排层（架构文档 §4.3「11-128 退避逻辑保持在转发层」），
     /// 这里只回答「这个错误要不要退避、退多久、为什么」——
     /// 「哪个码是敏感词拦截」是 workbuddy 的知识，不该漏进 `upstream/`。
     ///
@@ -406,21 +437,23 @@ impl ProviderAdapter for WorkBuddyAdapter {
         let retry = crate::server::config::retry_settings();
         Some(RetryAdvice {
             delay_ms: retry.delay_ms(),
-            reason: "上游敏感词拦截（11128），请检查提示词中的敏感词（可在设置页「通用 → 指纹脱敏」开关）"
+            reason: "上游敏感词拦截（11-128），请检查提示词中的敏感词（可在设置页「通用 → 指纹脱敏」开关）"
                 .to_string(),
         })
     }
 
-    /// workbuddy 有环境变量凭证旁路（`WORKBUDDY_TOKEN`），
+    /// workbuddy 有环境变量凭证旁路（国内版 `WORKBUDDY_TOKEN`、
+    /// 国际版 `WORKBUDDY_INTL_TOKEN`），
     /// 因此账号列表为空时仍可用默认登录态转发（脚本 / CI 用户的常规用法）。
     fn allows_anonymous_default_session(&self) -> bool {
         true
     }
 
     /// 环境变量旁路凭证此刻是否存在（聚合目录判「这家现在有没有可用登录态」用）。
-    /// 只判「存在且非空」，与 `env_access_token()` 同一判据。
+    /// 只判「存在且非空」，与 `Region::env_token` 同一判据 ——
+    /// 按**本实例的地区**取变量（一个 token 只属于一个站点，见那里的说明）。
     fn env_credentials_present(&self) -> bool {
-        env_access_token().is_some()
+        self.region.env_token().is_some()
     }
 
     /// workbuddy 有「默认模型」概念（config.json 的 `defaultModel`，缺省 auto）；
@@ -524,12 +557,14 @@ impl ProviderAdapter for WorkBuddyAdapter {
     }
 }
 
-/// 默认登录态的 access token（环境变量优先，其次账号存储派生的当前账号）。
+/// 本地区默认登录态的 access token（环境变量优先，其次账号存储派生的当前账号）。
 ///
-/// 与改造前 `auth::get_current_session` 的优先级一致：`WORKBUDDY_TOKEN`
+/// 与改造前 `auth::get_current_session` 的优先级一致：本地区对应的环境变量
 /// 存在时直接用它、完全不看账号库（脚本/CI 用户的旁路入口）。
-async fn default_session_token(store: &AccountStore) -> Result<String, GatewayError> {
-    if let Some(token) = env_access_token() {
+/// 「本地区」由调用方给的 `region` 决定 —— 变量名按地区分开，见
+/// `Region::env_token`。
+async fn default_session_token(store: &AccountStore, region: Region) -> Result<String, GatewayError> {
+    if let Some(token) = region.env_token() {
         return Ok(token);
     }
     let auth = AuthService::for_store(store.clone());
@@ -551,14 +586,6 @@ async fn default_session_token(store: &AccountStore) -> Result<String, GatewayEr
     }
 }
 
-/// 环境变量里的 access token（`WORKBUDDY_TOKEN`，空白串视为未设置）
-fn env_access_token() -> Option<String> {
-    std::env::var("WORKBUDDY_TOKEN")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 // ─── 头集合与 URL（从 upstream/request.rs 搬入，语义逐字保持）──────
 
 /// 客户端身份 + 鉴权 + 会话追踪头（对照 Node 的 buildHeaders）。
@@ -566,11 +593,20 @@ fn env_access_token() -> Option<String> {
 /// `request_id` 同时充当 X-Request-ID / X-Conversation-Request-ID /
 /// X-Conversation-ID / X-Session-ID —— Node 在没有 conversationId 时就是
 /// 这四者取同一个值（追踪一轮对话用）。
-fn chat_headers(session: &Value, request_id: &str, accept: Option<&str>) -> Vec<(String, String)> {
-    let edition: &'static crate::server::core::endpoints::EditionInfo =
-        crate::server::core::endpoints::resolve_edition(
-            session.get("edition").and_then(Value::as_str),
-        );
+///
+/// ── 客户端身份按 `region` 取（拆家后的口径）────────────────────
+/// 改造前这里读的是 `session.edition`（账号上的字段）。拆家后**provider id
+/// 就是权威**：账号在哪个地区组里，就按哪个地区的身份发请求 —— 这与
+/// `api::session` 里 ZCode 那段注释同一条理由（拿账号字段定地区，会让
+/// 「落错家的账号」把请求稳定打到错域名上，而那种错没有任何日志会提示）。
+/// 账号记录里的 `endpoint` 覆盖仍然优先（见 `chat_completions_url`）。
+fn chat_headers(
+    session: &Value,
+    region: Region,
+    request_id: &str,
+    accept: Option<&str>,
+) -> Vec<(String, String)> {
+    let edition = region.edition();
     let mut headers: Vec<(String, String)> = vec![
         ("Content-Type".to_string(), "application/json".to_string()),
         // 完整三段 UA（含 CLI 扩展段）：与桌面客户端一致，服务端按此识别通道
@@ -597,13 +633,17 @@ fn chat_headers(session: &Value, request_id: &str, accept: Option<&str>) -> Vec<
     headers
 }
 
-/// 对话接口 URL：`{session.endpoint || 默认端点}/v2/chat/completions`。
+/// 对话接口 URL：`{session.endpoint || 本地区端点}/v2/chat/completions`。
 ///
-/// 兜底端点取自 `endpoints::default_context()` —— 与 `AuthService` 构造时
-/// 用的那个上下文同源（改造前由 `forward` 从 `auth.default_context()` 传入），
-/// 因此「账号记录里没有 endpoint」时的回落值与改造前逐字相同。
-fn chat_completions_url(session: &Value) -> String {
-    let fallback = crate::server::core::endpoints::default_context().base_url;
+/// 兜底端点取**本实例的地区**（拆家前取 `endpoints::default_context()`，
+/// 那是「本进程只有一个上游」时代的产物：它读 `WORKBUDDY_EDITION` 环境变量，
+/// 而现在两个地区同时存在，环境变量不该再决定某个 provider 打哪个站）。
+/// 账号记录里带 `endpoint` 时仍然以它为准 —— 那是 staging / 自建反向代理
+/// 用户的落点，也是同一个账号级别的覆盖能力。
+fn chat_completions_url(session: &Value, region: Region) -> String {
+    let fallback = region
+        .env_endpoint_override()
+        .unwrap_or_else(|| region.default_endpoint().to_string());
     let endpoint = session
         .get("endpoint")
         .and_then(Value::as_str)

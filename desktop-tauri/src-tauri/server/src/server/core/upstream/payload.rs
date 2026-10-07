@@ -102,6 +102,12 @@ pub(super) struct ProviderContext<'a> {
     /// 语义不会中途漂移。传引用是因为它由 `upstream::forward` 的栈帧持有，
     /// 生命周期覆盖整条转发链。
     pub key_scope: Option<&'a crate::server::core::key_scope::KeyScope>,
+    /// 只准用这个账号（模型测试；`None` = 走全局优先级队列）。
+    ///
+    /// 与 `key_scope` 同一分工：它是「本次转发的收窄条件」，被选路与换号两处
+    /// 读同一份，语义不会中途漂移。收窄的语义见
+    /// [`super::ForwardRequest::pinned_account`] 与 `rotate::accounts_in_providers`。
+    pub pinned_account: Option<&'a str>,
 }
 
 /// 某一家 provider 实际要发送的请求体（**每次转发前**决定，不做跨家复用），
@@ -192,7 +198,7 @@ pub(super) fn send_body<'a>(
         None => Cow::Borrowed(ctx.body),
     };
     // ── ② 指纹脱敏层（核心规则见 `core::sanitize`）─────────────────────
-    let mut body = match ctx.sanitize_fingerprints {
+    let body = match ctx.sanitize_fingerprints {
         true => match crate::server::core::sanitize::sanitize_body(after_prompt.as_ref()) {
             Some((scrubbed, hits)) => {
                 // 命中表可能为空：`sanitize_text` 末尾的去空白也能单独构成一次
@@ -206,6 +212,35 @@ pub(super) fn send_body<'a>(
             None => after_prompt,
         },
         false => after_prompt,
+    };
+    // ── ③ 原生（服务端执行）工具声明闸门 ──────────────────────────────
+    // 内置家是各家官方客户端的后端：官方客户端只声明 `type:"function"` 的函数
+    // 工具（联网搜索走客户端自己的链路），上游对原生工具类型的处理从「整轮 400」
+    // （CatPaw）到「静默剔除」（Qoder / Trae）都有 —— 所以统一在这里降级：
+    // 剔除 + 留痕，各家适配器看到的永远只有函数工具。
+    //
+    // 自定义家**不**走这道闸门（判据是 `is_custom_provider_id`）：chat 分支只剔
+    // 带标记的跨协议声明（透传是它的契约，见 `providers::custom::forward`），
+    // 翻译分支在出站转换器里自己处理。这里先剔会把客户端声明的 chat 方言原生
+    // 工具（智谱那套）也一并删掉，与透传契约矛盾。
+    // 日后若某家确认支持某个原生工具，在这里（唯一闸门）按家/按类型开白即可。
+    // 完整取舍见 `core::protocol::native_tool` 的模块头。
+    let mut body = if crate::server::core::custom_providers::is_custom_provider_id(provider_id) {
+        body
+    } else {
+        match crate::server::core::protocol::native_tool::downgrade(body.as_ref()) {
+            Some((next, dropped)) => {
+                logging::log(
+                    "[Upstream]",
+                    &dropped.describe(
+                        Some(provider_id),
+                        Some("本上游只承载 type:\"function\" 的函数工具"),
+                    ),
+                );
+                Cow::Owned(next)
+            }
+            None => body,
+        }
     };
     let requested = body
         .get("model")

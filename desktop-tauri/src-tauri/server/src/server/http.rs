@@ -1,8 +1,11 @@
 //! axum Router 组装：路由表、CORS、API Key 检查、404/405 兜底、body 限制。
 //!
 //! 与 Node 版 server.mjs 的 `createRequestHandler`（672-991 行）逐条对齐：
-//!   - 每个响应都带 CORS 头（含 404 与错误响应）—— Node 版在最外层无条件下发
-//!   - OPTIONS 直接回 204（预检不需要业务逻辑）
+//!   - 面板面（`/api/*` 与静态界面）每个响应都带 CORS 头（含 404 与错误响应）
+//!     —— Node 版在最外层无条件下发；OPTIONS 直接回 204（预检不需要业务逻辑）
+//!   - 网关面（`/v1/*`）的 CORS 默认**关**，由设置页「安全 → 网关跨域访问」
+//!     打开（见 [`cors_gateway`] 与 `config::KEY_CORS_ENABLED`）—— 它是真正转发
+//!     上游的那一面，`*` 不该无条件开着
 //!   - 未配置 API Key 时全部放行；配置后由中间件统一比对
 //!   - 404 文案 `Not found: <METHOD> <path>`
 //!   - 未捕获错误统一走 errors::GatewayError → OpenAI 风格 payload + 500
@@ -91,6 +94,12 @@ pub fn panel_router(state: ServerState) -> Router {
         // ALTCHA 领题：与 status / setup 同为「认证边界」端点 —— 领题时
         // 用户还没有任何凭证（开关关闭时回 400，前端跳过校验）
         .route("/api/panel/captcha", get(api::panel::captcha_challenge))
+        // 会话传输探测（登录页连打两发）：同为 public —— 探测在登录之前，
+        // 只种/读一枚 60 秒寿命的探针 cookie，不建立会话、不校验值
+        // （见 api::panel::cookie_probe）
+        // any 而不是 get：探针要与登录**同动词**（POST）—— 有的中转按方法
+        // 区别对待 Set-Cookie，只测 GET 会误报「cookie 通道完好」
+        .route("/api/panel/cookie-probe", any(api::panel::cookie_probe))
         // CatPaw 网页登录的 loopback 回调：**上游浏览器直接 POST 到这里**
         // （redirect 指向本网关自己的 loopback 端口，见 core::login::catpaw），
         // 所以它必须免鉴权 —— 调用方是美团 passport 页面，它没有我们的 API Key。
@@ -100,6 +109,13 @@ pub fn panel_router(state: ServerState) -> Router {
         .route(
             "/api/session/login/catpaw-callback",
             post(api::session::login_catpaw_callback),
+        )
+        // 小浣熊远程网页登录回调：网页 shim 使用官方授权页的 redirect 分支，
+        // 浏览器把 authorization_code 以 GET 查询串带回当前面板。调用方是
+        // 上游授权页，不能携带管理 API Key，因此由一次性任务 state 保护。
+        .route(
+            "/api/session/login/raccoon-callback",
+            get(api::session::login_raccoon_callback),
         )
         // AutoClaw OAuth（国际版）的 loopback 回调：**浏览器 302 到这里**
         // （授权页完成后顶层导航到我们交给上游的 navigate_uri，见
@@ -296,10 +312,10 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/session/login/start", post(api::session::login_start))
         .route("/api/session/login/wait", get(api::session::login_wait))
         .route("/api/session/login/cancel", post(api::session::login_cancel))
-        // 网页登录的回调入口：壳侧登录窗口把 `office-raccoon://auth/callback?…`
-        // 原样 POST 到这里（Tauri 不能像 Electron 那样在会话里注册协议处理器，
-        // 见 api::session::login_callback 的说明）。与其他 login/* 一样在
-        // protected 组 —— 它写账号库，必须过 API Key。
+          // 网页登录的回调入口：壳侧登录窗口或远程网页面板把回调地址原样
+          // POST 到这里（Tauri 不能像 Electron 那样在会话里注册协议处理器，
+          // 见 api::session::login_callback 的说明）。与其他 login/* 一样在
+          // protected 组 —— 它写账号库，必须过 API Key。
         .route("/api/session/login/callback", post(api::session::login_callback))
         // AutoClaw 的手机号验证码登录（**不是**网页登录，见 api::session 模块头）：
         // 上游没有授权码 / 回调这条路，登录就是「发码 → 用码换 token」两次请求，
@@ -312,6 +328,17 @@ pub fn panel_router(state: ServerState) -> Router {
         .route(
             "/api/session/login/sms/verify",
             post(api::session::login_sms_verify),
+        )
+        // Loomy 的手机号验证码登录（同样两段、同样 protected：都写账号库）。
+        // 与上面那对分开挂是刻意的：两条链路的签名 / 站点 / 错误码完全不同，
+        // 合成一个端点会需要在 handler 里按 provider 分叉。
+        .route(
+            "/api/session/login/loomy/sms/send",
+            post(api::session::login_loomy_sms_send),
+        )
+        .route(
+            "/api/session/login/loomy/sms/verify",
+            post(api::session::login_loomy_sms_verify),
         )
         // AutoClaw OAuth 网页登录（**国际版**的官方主方式）。三段里只有前两段
         // 在这里：第三段（loopback 回调）在 public 组（调用方是用户的浏览器，
@@ -351,6 +378,11 @@ pub fn panel_router(state: ServerState) -> Router {
         // 能力位覆盖（纠正对下游声明的那五个字段；只服务内置家，自定义家
         // 走 /api/custom-providers/models 的整表保存，见该 handler 的说明）
         .route("/api/models/capabilities", post(api::model_manage::set_capabilities))
+        // 模型测试（模型管理页操作列的「测试」）：会**真打上游、消耗额度**，
+        // 与 /v1/chat/completions 同一量级的接口，必须挂 protected。
+        // 结论失败也返回 2xx（上游的错误放在响应体的 status / error 里，
+        // 理由见 api::model_test 模块头）
+        .route("/api/models/test", post(api::model_test::run_model_test))
         // ── 自定义提供商（用户自建上游端点：存储 + 管理）──
         // 与 /api/models/manage 同级敏感：写配置（customProviders 键）且「新建」
         // 会顺带写账号库，挂 protected。账号侧不经这里 —— 客户端走
@@ -397,6 +429,23 @@ pub fn panel_router(state: ServerState) -> Router {
         .route(
             "/api/sanitize",
             get(api::sanitize::get_sanitize).put(api::sanitize::put_sanitize),
+        )
+        // ── Cline 伪装头的逐键覆盖 ──
+        // 与 /api/sanitize 同形（GET 读 / PUT 写，响应体就是新状态），挂
+        // protected：头集合决定出站请求「长得像不像官方客户端」，敏感度同级。
+        // 默认值与合并语义见 `core::providers::cline::headers`。
+        .route(
+            "/api/cline/headers",
+            get(api::cline_headers::get_cline_headers).put(api::cline_headers::put_cline_headers),
+        )
+        // ── 网关面跨域访问开关 ──
+        // 与 /api/sanitize 同形的单开关端点（GET 读 / PUT 写），挂 protected：
+        // 它决定 `/v1/*` 要不要应答浏览器跨源请求（见 api::cors 的模块头）。
+        // 敏感度高一级 —— 打开等于把「转发上游、消耗额度」的能力交给任何网页，
+        // 所以默认关，且改动会写进事件日志。
+        .route(
+            "/api/cors",
+            get(api::cors::get_cors).put(api::cors::put_cors),
         )
         // ── 机器人校验开关 ──
         // 与 /api/sanitize 同形的单开关端点（GET 读 / PUT 写），挂 protected：
@@ -520,12 +569,15 @@ pub fn gateway_router(state: ServerState) -> Router {
         .route("/v1/messages/count_tokens", post(api::chat::count_tokens))
         .layer(middleware::from_fn(require_api_key))
         .with_state(state);
-    // 网关面必须显式 disable：axum 对没挂 DefaultBodyLimit 层的路由兜底
-    // 2MB（axum-core Request::with_limited_body），长上下文 + base64 图片
-    // 的大请求体会被先拒成 413，客户端重试原样请求体只会白打转。这里的
-    // disable 在合并形态下也压得过面板路由外层的 max —— 扩展是逐层 insert，
-    // 内层后写覆盖外层先写。上限交给上游自己表达。
     open.merge(guarded)
+        // CORS 挂在最外层：预检、404 与错误响应都要带上 CORS 头（同面板路由的口径）。
+        // 只在设置里打开「网关跨域访问」后生效 —— 见 cors_gateway 的说明。
+        .layer(middleware::from_fn(cors_gateway))
+        // 网关面必须显式 disable：axum 对没挂 DefaultBodyLimit 层的路由兜底
+        // 2MB（axum-core Request::with_limited_body），长上下文 + base64 图片
+        // 的大请求体会被先拒成 413，客户端重试原样请求体只会白打转。这里的
+        // disable 在合并形态下也压得过面板路由外层的 max —— 扩展是逐层 insert，
+        // 内层后写覆盖外层先写。上限交给上游自己表达。
         .layer(axum::extract::DefaultBodyLimit::disable())
 }
 
@@ -570,6 +622,28 @@ async fn cors(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     attach_cors(response.headers_mut());
     response
+}
+
+/// 网关面（`/v1/*`）的 CORS 中间件：只有设置页把「网关跨域访问」打开后才生效。
+///
+/// ── 为什么网关面要单独一个中间件 ─────────────────────────────
+/// [`cors`] 挂在 [`panel_router`] 里，而 axum 的 `Router::layer` **只作用于调用它
+/// 时已经存在的路由**：`router()` 是 `panel_router().merge(gateway_router())`，
+/// 合并进来的 `/v1/*` 拿不到面板那一层 —— 于是网关面从来不应答预检，浏览器客户端
+/// 的 OPTIONS 会落到 API Key 中间件上被 401 拒掉（预检按规范不携带
+/// `Authorization` 头），页面侧只看到「无法连接 API」。这里把同一套 CORS 行为
+/// 补给网关面，但**按开关**（默认关，见 `config::KEY_CORS_ENABLED`）：网关面是
+/// 真正转发上游、消耗额度的那一面，`*` 不该无条件开着。
+///
+/// 关着时什么都不做（连 OPTIONS 也不拦）：行为与修复前逐字一致 —— 预检照旧落到
+/// 鉴权上被拒。这就是「默认关」的含义。
+async fn cors_gateway(request: Request, next: Next) -> Response {
+    // 走轻量读取：这条判定在每个 /v1 请求上跑一次，不值得克隆整份配置（见
+    // `config::cors_enabled` 的说明）
+    if !crate::server::config::cors_enabled() {
+        return next.run(request).await;
+    }
+    cors(request, next).await
 }
 
 /// 写入三个 CORS 头（值固定，不会失败；失败时静默跳过而不是 panic）
@@ -638,6 +712,37 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
             // Key 也能操作管理接口（桌面壳 / 脚本自动化的通道）
             return next.run(request).await;
         }
+        // 诊断：面板认证分支的 401 此前是静默的 —— 「登录成功却被弹回登录
+        // 页」时这一行是唯一现场：两路凭证（cookie / 请求头）各自看到了什么，
+        // 一眼定位是令牌没送到还是没存上。登录页每次加载的 /api/session 探测
+        // 也会命中这一行（预期内的 401），属正常噪声。
+        // 除了「本家那把在不在」，还要看**这一趟到底带回来了哪几把 cookie**：
+        // 中转把多条 Set-Cookie 合并/丢一条时，浏览器回带的常常是探针或上一轮的
+        // 会话 —— "cookie=有"这三种情况在旧文案里长得一模一样，分不出"没送到"
+        // 与"送到但不是这把"。只列名字，值不写（见 `access::cookie_names`）。
+        let names = crate::server::access::cookie_names(request.headers());
+        let seen_headers: Vec<&str> = ["x-panel-token", "x-panel-refresh", "authorization"]
+            .into_iter()
+            .filter(|name| request.headers().contains_key(*name))
+            .collect();
+        // 指纹按**候选顺序**逐个列（最多两把）：同名 cookie 重复上行 + 头里还躺着
+        // 旧令牌时，"哪一把被试过"就是这一行要回答的问题 —— 只打第一把会把
+        // 「cookie 短路」这种故障伪装成「什么都没带」。
+        let fingerprints = crate::server::access::access_fingerprints(request.headers());
+        logging::log(
+            "[Security]",
+            &format!(
+                "❌ 面板会话无效: {} {path}（试过的凭证指纹={} 带回来的 cookie={} 凭证头={}）",
+                request.method(),
+                if fingerprints.is_empty() {
+                    "无".to_string()
+                } else {
+                    fingerprints.join(",")
+                },
+                if names.is_empty() { "无".to_string() } else { names.join("|") },
+                if seen_headers.is_empty() { "无".to_string() } else { seen_headers.join("+") },
+            ),
+        );
         return errors::panel_login_required_response();
     }
     // ── 未注册闸门（headless 专属，桌面壳不开启）────────────────
@@ -893,4 +998,121 @@ pub fn parse_query_ms(value: Option<&String>) -> Option<i64> {
         return None;
     }
     Some(number as i64)
+}
+
+#[cfg(test)]
+mod cors_tests {
+    //! 网关面（`/v1/*`）CORS 的行为用例。
+    //!
+    //! ── 为什么要钉住这组行为（回归背景）────────────────────────
+    //! `cors` 挂在 `panel_router` 里，而 axum 的 `Router::layer` **只作用于调用它
+    //! 时已经存在的路由**：`router()` 是 `panel_router().merge(gateway_router())`，
+    //! 合并进来的 `/v1/*` 拿不到面板那一层。表现出来就是：浏览器（任何第三方来源）
+    //! 的预检 OPTIONS 落到 API Key 中间件上被 401 拒掉（预检按规范不携带
+    //! `Authorization`），页面侧只看到一句「无法连接 API」。这里把网关面的行为
+    //! 钉住：默认不动（与修复前一致），开关打开后按面板口径应答。
+    //!
+    //! 用 `oneshot` 直接打 Router，不起 serve、不占端口。
+
+    use super::*;
+    use axum::body::Body;
+    use axum::routing::post;
+    use tower::ServiceExt;
+
+    /// 与 `gateway_router` 网关面同构的最小路由：业务处理恒返回 200，
+    /// 只用来观察 `cors_gateway` 在预检与普通请求上的行为。
+    fn probe_router() -> Router {
+        Router::new()
+            .route("/v1/chat/completions", post(|| async { "ok" }))
+            .layer(middleware::from_fn(cors_gateway))
+    }
+
+    async fn call(router: &Router, method: Method, path: &str) -> Response {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("请求构造不应失败"),
+            )
+            .await
+            .expect("Router 的错误类型是 Infallible")
+    }
+
+    /// 开关关闭（默认）→ 不应答预检、不带 CORS 头；打开 → 预检 204 + 三个头、
+    /// 普通响应也带头。
+    ///
+    /// 两种状态写在同一个用例里：开关是进程级全局状态，拆成两个 `#[tokio::test]`
+    /// 会被并行执行互相干扰（一个置 true、另一个正在断言 false）。
+    #[tokio::test]
+    async fn gateway_cors_follows_switch() {
+        // ── 关闭（默认）：行为与修复前逐字一致 ──
+        crate::server::config::set_cors_enabled(false);
+        let router = probe_router();
+
+        let preflight = call(&router, Method::OPTIONS, "/v1/chat/completions").await;
+        assert_ne!(
+            preflight.status(),
+            StatusCode::NO_CONTENT,
+            "关闭时中间件不应短路预检，它该继续往下走到鉴权"
+        );
+        assert!(
+            !preflight
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            "关闭时不应带 CORS 头"
+        );
+
+        // ── 打开：按面板路由的老口径应答 ──
+        crate::server::config::set_cors_enabled(true);
+        let router = probe_router();
+
+        let preflight = call(&router, Method::OPTIONS, "/v1/chat/completions").await;
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
+        assert!(preflight
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_METHODS));
+        assert!(preflight
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_HEADERS));
+
+        let ok = call(&router, Method::POST, "/v1/chat/completions").await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert!(
+            ok.headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            "开关打开后普通响应也要带 CORS 头"
+        );
+
+        // 全局状态复位，避免影响同进程的其它用例
+        crate::server::config::set_cors_enabled(false);
+    }
+
+    /// `attach_cors` 写满三个头（纯函数，不依赖运行时与配置快照）。
+    #[test]
+    fn attach_cors_writes_three_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        attach_cors(&mut headers);
+        assert_eq!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "*"
+        );
+        assert_eq!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_METHODS).unwrap(),
+            CORS_METHODS
+        );
+        assert_eq!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_HEADERS).unwrap(),
+            CORS_HEADERS
+        );
+    }
 }

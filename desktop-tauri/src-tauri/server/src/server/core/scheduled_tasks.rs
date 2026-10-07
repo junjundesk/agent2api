@@ -90,7 +90,7 @@ pub const TASKS: [TaskDef; 7] = [
     TaskDef {
         id: TASK_USAGE_QUERY,
         label: "定时查询积分",
-        description: "定期查询已启用账号的余额 / 积分。启动先展示上次结果，到期再查询；失败会保留查询时间与错误，不因重启反复请求上游。",
+        description: "定期查询全部账号的余额 / 积分（含已禁用账号 —— 禁用只表示不参与转发，不影响余额能否查；凭证不完整的账号会跳过）。启动先展示上次结果，到期再查询；失败会保留查询时间与错误，不因重启反复请求上游。",
         unit: "minutes",
         runner: Runner::Backend,
         min: config::INTERVAL_MIN_MINUTES,
@@ -287,6 +287,24 @@ pub async fn run_now(store: &AccountStore, update: &UpdateManager, id: &str) -> 
     run_backend(store, update, task, true).await
 }
 
+/// 「部分账号失败」算不算这一轮失败（`RunGuard::finish` 的 `success`）。
+///
+/// ── 为什么不算 ──────────────────────────────────────────────
+/// `success = false` 会按失败次数做指数退避（最长 24 小时，见 `core::task_state`
+/// 的 `RunGuard::finish`）。而这两条任务的失败是**按账号**的：一个账号的登录态被
+/// 上游作废（refreshToken 废了、积分接口稳定 401）就足以让「定时查询积分」每一轮
+/// 都判失败一次，整条任务于是被推到几小时后再跑 —— 其余几十个账号的余额跟着一起
+/// 变旧，界面上那几行停在上一轮（真实事故：2026-10-06 上午 10:12 之后余额快照再没
+/// 更新过，两个坏账号把整条任务顶进了长退避）。失败本身已经如实进了快照与日志
+/// （界面上那一行会红），不需要再把整轮一起罚掉。
+///
+/// ── 为什么「一个都没成功」仍算失败 ───────────────────────────
+/// 全失败通常意味着更上游的问题（断网、出口被挡、上游整体故障）：这时保留退避，
+/// 别按原间隔反复打上游。判据因此是「有失败 **且** 一个都没成功」。
+fn round_succeeded(succeeded: usize, failed: usize) -> bool {
+    failed == 0 || succeeded > 0
+}
+
 async fn run_backend(
     store: &AccountStore,
     update: &UpdateManager,
@@ -304,13 +322,17 @@ async fn run_backend(
             summary
         } else { "已完成版本检查".to_string() });
     }
-    // 「模型目录刷新」的手动执行与界面上的「获取模型」是同一件事（都走
-    // `refresh_implemented_forced`），因此同样越过失败冷却；其余任务的手动执行
-    // 保持「只提前排期」—— 那些冷却记的是上游配额桶的恢复时刻（见 ManualBackoff）。
-    let backoff = if task.id == TASK_MODEL_REFRESH {
-        task_state::ManualBackoff::Bypass
-    } else {
-        task_state::ManualBackoff::Respect
+    // 手动执行越不越过失败冷却：按**冷却记的是什么**分两类（见 `ManualBackoff`）。
+    //   · 记「上一轮为什么没成功」的（模型目录刷新、定时查询积分、凭证维护）——
+    //     用户按按钮往往正是刚把那个原因修好（换了账号、重新登录、把坏账号删了），
+    //     继续拿旧结论挡着只会让按钮看起来是坏的；
+    //   · 记「上游配额桶什么时候恢复」的（检查更新）—— 提前打一次只会再吃一次
+    //     403 并把恢复时刻重新顶到未来，如实告诉用户还要等多久更有用。
+    let backoff = match task.id {
+        TASK_MODEL_REFRESH | TASK_USAGE_QUERY | TASK_CREDENTIAL_MAINTENANCE => {
+            task_state::ManualBackoff::Bypass
+        }
+        _ => task_state::ManualBackoff::Respect,
     };
     let guard = match task_state::claim(task.id, interval_ms(task), manual, backoff, 1_000)? {
         Claim::Acquired(guard) => guard,
@@ -324,7 +346,7 @@ async fn run_backend(
             if refreshed > 0 || failed > 0 {
                 logging::log_with_level("[Maintenance]", &format!("凭证自动维护：{summary}"), if failed > 0 { "error" } else { "info" });
             }
-            (summary, failed == 0)
+            (summary, round_succeeded(refreshed, failed))
         }
         TASK_MODEL_REFRESH => {
             let results = if manual {
@@ -348,7 +370,17 @@ async fn run_backend(
             match crate::server::core::usage_query::query_all(store, None).await {
                 Ok(report) => {
                     let (ok, failed) = crate::server::core::usage_query::store_snapshot(report);
-                    (format!("成功 {ok} 个，失败 {failed} 个"), failed == 0)
+                    let summary = format!("成功 {ok} 个，失败 {failed} 个");
+                    if failed > 0 {
+                        // 失败的行进快照（界面那一行会红）也要留一条日志：快照只
+                        // 留最后一次结果，日志才是「什么时候开始坏的」的唯一线索
+                        logging::log_with_level(
+                            "[Usage]",
+                            &format!("定时查询积分：{summary}"),
+                            "error",
+                        );
+                    }
+                    (summary, round_succeeded(ok, failed))
                 }
                 Err(error) => (format!("查询失败：{}", error.message), false),
             }

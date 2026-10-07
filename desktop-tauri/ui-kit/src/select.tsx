@@ -40,6 +40,12 @@ function SelectTrigger({ className, children, ...props }: SelectTriggerProps) {
       data-slot='select-trigger'
       className={cn(
         'inline-flex h-[30px] min-w-0 cursor-pointer items-center justify-between gap-1.5 rounded-md border border-control-border bg-control px-2.5',
+        // 选中值（SelectValue 渲染出的 span）是触发器的 flex 子项，默认
+        // min-width:auto 不收缩：标签比触发器宽时会把边框撑破、文字溢出去
+        // （账号表代理列实测）。truncate 把 overflow 变 hidden，自动最小尺寸
+        // 随之归零，过长标签省略号收口 —— 完整值在展开的浮层与触发器的 title 里。
+        // 这条选择器会连箭头图标的 span 一起命中，truncate 不改 display，对它无影响。
+        '[&>span]:min-w-0 [&>span]:truncate',
         'text-[12.5px] font-normal text-foreground',
         'transition-colors duration-150 ease-out',
         'hover:border-control-border-hover hover:bg-control-hover',

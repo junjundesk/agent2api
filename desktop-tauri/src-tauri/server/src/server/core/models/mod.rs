@@ -35,12 +35,28 @@
 //! 构造件（条目字段映射、响应信封、相近提示纯函数）——
 //! 于是「单家清单」与「聚合清单」永远不会在字段映射上分叉。
 //!
+//! ── 国内版 / 国际版拆家后：**一家两份清单**（2026-10）─────────
+//! WorkBuddy 的国际版是独立 provider（`workbuddy-intl`，见
+//! `providers::workbuddy::region`），它有**自己的** `/v3/config` 清单与自己的
+//! 持久化缓存槽。两个地区的清单在结构上是两份独立数据（上游按站点下发各自
+//! 的模型表），因此本模块的目录句柄从「一个单例」变成「按地区各一个」：
+//! `global_catalog(region)` 返回对应地区那一份，`ModelCatalog` 自己也记住
+//! 「我是谁的清单」（provider id / 缓存 scope / 版本），于是 `owned_by`、
+//! 缓存读写、默认规则种子的 provider 键都从实例上取，而不是写死常量。
+//!
+//! 拆家前这两份清单挤在同一个 `OnceLock` 里：用国内账号拉一次、再用国际账号
+//! 拉一次会**互相覆盖**（issue #74 的根因）。现在各刷各的、各自恢复各自的缓存。
+//!
+//! 内置兜底清单（`builtin_models`）两地共用同一份：它是「远程不可用时的兜底」，
+//! 拆家前国际版用户看到的就是它，改成空清单会让首次启动且刷新失败时国际版
+//! 一个模型都没有（比现状退化）。
+//!
 //! 词法上本模块是个目录（`models/mod.rs` + `models/shape.rs`）：拆分的唯一
 //! 理由是单文件行数约定（≤800 行），职责边界与拆分前完全一致。
 //!
 //! ── 进程级句柄 ──────────────────────────────────────────────
-//! `global_catalog()` 是聚合层的读取口（`OnceLock` 单例，与
-//! `config::init` 同一模式）：`ServerState::bootstrap` 与聚合层
+//! `global_catalog(region)` 是聚合层的读取口（每个地区一个 `OnceLock` 单例，
+//! 与 `config::init` 同一模式）：`ServerState::bootstrap` 与聚合层
 //! 拿到的是同一实例，刷新对两边同时可见。
 
 mod shape;
@@ -51,7 +67,8 @@ use serde_json::{json, Value};
 
 use crate::server::core::auth_http::send_raw;
 use crate::server::core::endpoints::{normalize_endpoint, user_agent_for_edition};
-use crate::server::core::providers::{catalog_cache, kind_id, ProviderKind};
+use crate::server::core::providers::workbuddy::region::Region;
+use crate::server::core::providers::catalog_cache;
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::logging;
 
@@ -207,8 +224,11 @@ fn allowlist_fallback() -> Vec<Value> {
 /// 上游下发的清单，只是可能旧一些。管理页的「来源」列与 `/v1/models` 的
 /// `meta.source` 因此显示「远程」而不是「内置」——那是事实，且时间戳
 /// （`last_refreshed_at`）会如实给出它是什么时候拉的。
-fn initial_state() -> CatalogState {
-    if let Some(cached) = catalog_cache::load(catalog_cache::SCOPE_WORKBUDDY) {
+///
+/// 缓存槽与内置兜底按**地区**分（见模块头的拆家说明）：两个地区各读各的
+/// scope，内置兜底两地共用同一份。
+fn initial_state(region: Region) -> CatalogState {
+    if let Some(cached) = catalog_cache::load(region.catalog_scope()) {
         return CatalogState {
             models: cached.models,
             last_refreshed_at: cached.fetched_at,
@@ -221,21 +241,32 @@ fn initial_state() -> CatalogState {
 }
 
 /// 模型目录句柄：内部一把 `RwLock`，克隆共享同一份状态。
+///
+/// `region` 是**这一份清单属于谁**（拆家后一个地区一个实例）：
+/// provider id 进 `owned_by`、缓存 scope 定位读写、版本决定 UA 与端点兜底 ——
+/// 三处都从实例取，而不是像拆家前那样写死常量（那正是「两份清单挤在一个
+/// 句柄里」的形态）。
 #[derive(Clone)]
 pub struct ModelCatalog {
+    region: Region,
     inner: Arc<RwLock<CatalogState>>,
 }
 
 impl Default for ModelCatalog {
     fn default() -> Self {
-        Self::new()
+        Self::new(Region::Cn)
     }
 }
 
 impl ModelCatalog {
     /// 构造目录（不刷新；刷新由启动流程与 /v1/models 触发）
-    pub fn new() -> Self {
-        Self { inner: Arc::new(RwLock::new(initial_state())) }
+    pub fn new(region: Region) -> Self {
+        Self { region, inner: Arc::new(RwLock::new(initial_state(region))) }
+    }
+
+    /// 这一份清单属于哪个地区
+    pub fn region(&self) -> Region {
+        self.region
     }
 
     /// 读取状态快照；锁中毒（持锁 panic）时接管内部数据继续用，
@@ -355,13 +386,16 @@ impl ModelCatalog {
     /// 的视图，排障时与聚合输出对比即可立刻分辨「是 workbuddy 清单不对」
     /// 还是「聚合/过滤逻辑不对」。对只有 workbuddy 一家的用户，
     /// 它与聚合输出逐字段相同（聚合层复用同一个 list_item / 信封）。
+    ///
+    /// `owned_by` 取本实例的地区（拆家后 `workbuddy` / `workbuddy-intl`）：
+    /// 写死国内版会让国际版的排障视图指错家。
     #[allow(dead_code)]
     pub fn list_response(&self) -> Value {
         let state = self.read();
         let data: Vec<Value> = state
             .models
             .iter()
-            .map(|model| list_item(model, kind_id(ProviderKind::WorkBuddy)))
+            .map(|model| list_item(model, self.region.provider_id()))
             .collect();
         list_response_from(
             data,
@@ -517,24 +551,36 @@ impl ModelCatalog {
         self.write(state.clone());
         // 落持久化缓存（进程重启后由 `initial_state` 读回，见 `catalog_cache`
         // 的模块头）。必须在写锁**之外**：缓存写入要拿库连接锁，而本目录的
-        // 硬约束是「持锁期间不做 IO」。
+        // 硬约束是「持锁期间不做 IO」。槽位按地区取 —— 两个地区的清单互不
+        // 覆盖（这正是拆家要修的那件事，见模块头）。
         catalog_cache::save(
-            catalog_cache::SCOPE_WORKBUDDY,
+            self.region.catalog_scope(),
             &state.models,
             state.last_refreshed_at,
         );
         // 远程清单首次落地时补一次 WorkBuddy 默认规则种子（默认只启用白名单内的
-        // 模型，见 model_rules::seed_workbuddy_defaults）。必须放在写锁之外：种子
+        // 模型，见 `model_rules::seed_workbuddy_defaults`）。必须放在写锁之外：种子
         // 要写 config.json，而「持锁期间不做任何 IO」是本目录的硬约束。
-        if let Some(summary) = crate::server::core::model_rules::seed_workbuddy_defaults(&ids) {
+        // provider 键取本实例的地区：种子按 `(provider, id)` 记账，国际版的
+        // 模型名与国内版可能同名，记错家会让两家的开关互相污染。
+        if let Some(summary) =
+            crate::server::core::model_rules::seed_workbuddy_defaults(
+                self.region.provider_id(),
+                &ids,
+            )
+        {
             logging::log("[Models]", &summary);
         }
     }
 
     /// 按当前账号的凭证/端点/UA/出口刷新一次（路由层与启动流程的入口）。
     ///
-    /// 「当前账号 = 队首的可用账号」（由 store 派生，与转发默认使用的账号一致），
-    /// 这里直接用它的凭证与出口，保证模型目录与转发看到的是同一个账号。
+    /// ── 「当前账号」是**本地区**的队首（拆家后的口径）──────────────
+    /// 本实例只承载一个地区，因此这里的「当前账号」必须收窄到本家的 provider
+    /// （`current_entry_for_provider`）—— 两个地区的账号混在一个队列里取队首，
+    /// 会让国内版的清单用国际版账号去拉（拆家前正是这个形态，症状是「拉一次
+    /// 换一个地区」，见 issue #74）。
+    ///
     /// `account_id` 非空 = 用户在「获取模型」弹窗里点名的那条：按 id 直取，
     /// **取不到就明确失败、不回落到队首**（否则清单会变成「选了 A、用的是 B」）。
     ///
@@ -551,12 +597,12 @@ impl ModelCatalog {
     ) -> RefreshOutcome {
         // 账号选取三档：
         //   · 点名了（`account_id` 非空）→ 按 id 直取那一条，取不到即失败（见上）；
-        //   · 没点名 → 队首账号优先（多账号时与转发一致）；
-        //   · 一条账号都没有 → 回落到默认登录态（环境变量 WORKBUDDY_TOKEN
-        //     或单账号 auth.json）。
+        //   · 没点名 → 本地区的队首账号优先（多账号时与转发一致）；
+        //   · 本地区一条账号都没有 → 回落到本地区的默认登录态（环境变量
+        //     `WORKBUDDY[_INTL]_TOKEN` 或单账号 auth.json）。
         let requested = account_id.trim();
         let (session, proxy) = if requested.is_empty() {
-            match store.get_current_entry() {
+            match store.current_entry_for_provider(self.region.provider_id()) {
                 Some(entry) => {
                     let proxy = crate::server::core::proxies::session_proxy(&entry.session);
                     (Some(entry.session), proxy)
@@ -589,12 +635,18 @@ impl ModelCatalog {
             return RefreshOutcome::not_refreshed(REASON_NO_SESSION);
         };
 
+        // 端点兜底按**本地区**取（账号记录里的 endpoint 仍是最高优先的覆盖项：
+        // 它带着账号自己的站点，也正是 staging / 反向代理用户的落点）。
+        let fallback_endpoint = self
+            .region
+            .env_endpoint_override()
+            .unwrap_or_else(|| self.region.default_endpoint().to_string());
         let endpoint = session
             .get("endpoint")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .map(normalize_endpoint)
-            .unwrap_or_else(|| normalize_endpoint(auth.default_context().base_url.as_str()));
+            .unwrap_or_else(|| normalize_endpoint(fallback_endpoint.as_str()));
         let enterprise_id = session
             .get("account")
             .and_then(|account| account.get("enterpriseId"))
@@ -602,7 +654,9 @@ impl ModelCatalog {
             .unwrap_or("")
             .to_string();
         let headers = crate::server::core::auth::AuthService::build_auth_headers(&session);
-        let user_agent = user_agent_for_edition(session.get("edition").and_then(Value::as_str));
+        // UA 按本地区的客户端身份（国际版是 `WorkBuddy AI/5.5.2`，国内版
+        // `WorkBuddy/5.5.4`；服务端按 UA 识别通道，给错会拿到另一套清单）
+        let user_agent = user_agent_for_edition(Some(self.region.id()));
 
         let outcome = self
             .refresh(RefreshParams {
@@ -689,7 +743,7 @@ pub fn builtin_models_snapshot() -> Value {
 
 // ─── 进程级目录句柄（聚合目录的读取口）──────────────────────
 
-/// 进程级 workbuddy 目录句柄。**为什么要全局**：聚合目录
+/// 进程级 workbuddy 目录句柄，**按地区各一个**。**为什么要全局**：聚合目录
 /// （`core::providers::catalog`）的公开 API 只收 `&AccountStore`（handler 手边
 /// 就有），不该再要求调用方层层传一个 ModelCatalog —— 那会把 `list_models` 与
 /// 将来 chat_completions 的签名都改一遍。全局句柄与 `config::current()` /
@@ -698,12 +752,17 @@ pub fn builtin_models_snapshot() -> Value {
 /// 取用方式是 `get_or_init`：`ServerState::bootstrap` 与聚合层拿到的是**同一个
 /// 实例**（共享同一把 RwLock），即使 bootstrap 被调用多次（重启路径）也不会
 /// 出现「ServerState 里刷新了、聚合层读的是另一份旧目录」这种分叉。
-static GLOBAL: OnceLock<ModelCatalog> = OnceLock::new();
+static WORKBUDDY_CATALOG: OnceLock<ModelCatalog> = OnceLock::new();
+/// 国际版的目录句柄（拆家后与国内版各自独立，见模块头）
+static WORKBUDDY_INTL_CATALOG: OnceLock<ModelCatalog> = OnceLock::new();
 
-/// 取进程级目录句柄；首次调用即构造（内置清单，不读盘、不刷新）。
+/// 取某个地区的进程级目录句柄；首次调用即构造（内置清单，不读盘、不刷新）。
 ///
 /// 构造顺序无关：任何模块在启动流程的任何阶段调它都能拿到一个可用的目录
 /// （最坏情况是「还没被 `/v3/config` 刷新过」的内置清单，与改造前的初始态一致）。
-pub fn global_catalog() -> ModelCatalog {
-    GLOBAL.get_or_init(ModelCatalog::new).clone()
+pub fn global_catalog(region: Region) -> ModelCatalog {
+    match region {
+        Region::Cn => WORKBUDDY_CATALOG.get_or_init(|| ModelCatalog::new(region)).clone(),
+        Region::Intl => WORKBUDDY_INTL_CATALOG.get_or_init(|| ModelCatalog::new(region)).clone(),
+    }
 }

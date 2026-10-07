@@ -13,6 +13,7 @@
 //!   login.rs       设备授权登录（WorkOS RFC 8628，四步含 /auth/register 换码）
 //!   refresh.rs     续期（POST /auth/refresh + 单飞 + 比较再写）
 //!   models.rs      模型目录（recommended-models + 两池 + 静态兜底 + 默认映射种子）
+//!   headers.rs     上游请求头（默认伪装头 + 设置页逐键覆盖的合并）
 //!   balance.rs     余额 / 订阅（credit 余额归一 + 套餐）
 //!   adapter.rs     ProviderAdapter 实现（无状态，OpenAI 兼容，**按池参数化**）
 //! ```
@@ -51,6 +52,7 @@
 pub mod adapter;
 pub mod balance;
 pub mod credentials;
+pub mod headers;
 pub mod login;
 pub mod models;
 pub mod refresh;

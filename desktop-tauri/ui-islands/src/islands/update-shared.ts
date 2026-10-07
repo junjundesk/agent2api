@@ -11,6 +11,10 @@
  * 出网代理的三件套（拉取 / 保存 / 选项构建）也放这：面板头部已不放代理下拉
  * （改成了「更新设置」按钮），这三件事只有弹窗用，但它们不依赖任何 React 状态，
  * 收在这里可以让 update-settings.tsx 只剩「弹窗的排版与流程」。
+ *
+ * 定时任务页（tasks-panel.tsx）也 import 这里的一个函数：它的「软件版本检查 ·
+ * 立即执行」查到新版本时经 forwardUpdateResult 走与轮询 / 面板检查同一条出口 ——
+ * 见该函数自己的说明。
  */
 
 import type * as React from 'react'
@@ -195,6 +199,31 @@ export function handleExternalClick(event: React.MouseEvent<HTMLElement>): void 
   if (!trigger) return
   event.preventDefault() // 掐掉 webview 自己的导航（跳过去只会白屏）
   void openExternal(trigger.dataset.external || '')
+}
+
+/**
+ * 把**最近一次检查结果**转交给更新面板：点亮「设置」导航项上的「新」，并在该弹的
+ * 时候弹出「检测到更新」弹窗（含更新日志与「去更新」）。读的是后端缓存
+ * （`/api/update/status`），不自己打 GitHub。
+ *
+ * ── 为什么收在这里 ──────────────────────────────────────
+ * 定时任务页的「软件版本检查 · 立即执行」与 app.js 的 20 秒轮询（`pollUpdateStatus`，
+ * 「定时任务到期 → 查到新版本」那条路）是**同一个出口**：走 app.js 的
+ * `updateUpdateBadge`，弹与不弹的判定（跳过此次更新 / 本会话已弹过 / 人已在设置页）
+ * 连同弹窗本体都在 update-modal.tsx。放在本文件是为了让「非更新家族的岛」也能拿到
+ * 同一条路，而不必各自 declare 一份桥、各写一份判定（那种写法迟早漂移）。
+ *
+ * 失败（后端不可用 / 读不到）只记控制台：调用方（如一次「立即执行」）自己已经把
+ * 结论播报过了，不该因为这一下转发失败把它报成失败。
+ */
+export async function forwardUpdateResult(): Promise<void> {
+  try {
+    const info = await shared().workbuddyDesktop?.getUpdateStatus?.()
+    // checked === false：后端还没有任何检查结果（本进程没查过），不拿它去动徽标 / 弹窗
+    if (info && info.checked !== false) shared().wbApp?.updateUpdateBadge?.(info)
+  } catch (error) {
+    console.warn('读取版本检查结果失败:', errorMessage(error))
+  }
 }
 
 /* ─── 出网代理（「更新设置」弹窗里的那一节）────── */
