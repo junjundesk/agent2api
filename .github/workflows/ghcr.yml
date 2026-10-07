@@ -9,9 +9,10 @@ name: ghcr
 # 不需要任何额外 secret，所以单独走一条。
 #
 # ── 触发方式 ──────────────────────────────────────────────────
-#   · 推 main：产出 :latest、:2.9.0-zcodefix 与 :sha-<短哈希>
-#     （:2.9.0-zcodefix 是为了与本地 docker build 出来的镜像 tag 对齐，
-#       服务器 compose 换镜像时可以直接改一行；不需要时可以删掉这条）
+#   · 推 main：产出 :latest、:<版本号>-zcodefix 与 :sha-<短哈希>
+#     （:<版本号>-zcodefix 是为了与本地 docker build 出来的镜像 tag 对齐，
+#       服务器 compose 换镜像时可以直接改一行；不需要时可以删掉这条。
+#       版本号从 package.json 读，发版改一处即可，不用回来改这个文件）
 #   · 推 v* tag：产出 :<版本号>
 #   · 手动 workflow_dispatch：与推 main 相同
 #
@@ -81,6 +82,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      - name: 读取版本号
+        id: ver
+        run: echo "version=$(node -p 'require("./package.json").version')" >> "$GITHUB_OUTPUT"
+
       - name: 生成镜像 tag
         id: meta
         uses: docker/metadata-action@v6
@@ -88,7 +93,7 @@ jobs:
           images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=2.9.0-zcodefix,enable={{is_default_branch}}
+            type=raw,value=${{ steps.ver.outputs.version }}-zcodefix,enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=sha,format=short
 
